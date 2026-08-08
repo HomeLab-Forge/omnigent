@@ -164,22 +164,40 @@ def _decode_output(output: Any) -> Mapping[str, Any]:
     return {}
 
 
-def _outcome(output: Any) -> tuple[Literal["success", "failure"], int | None]:
+def _outcome(output: Any) -> tuple[Literal["success", "failure", "unknown"], int | None]:
     payload = _decode_output(output)
+    if not payload:
+        text = output.lower() if isinstance(output, str) else ""
+        if re.search(r"\b(?:fatal|error)\b", text):
+            return "failure", None
+        return "unknown", None
+
     status = str(payload.get("status", "")).lower()
+    outcome = str(payload.get("outcome", "")).lower()
     exit_code = payload.get("exit_code")
     try:
         exit_code = int(exit_code) if exit_code is not None else None
     except (TypeError, ValueError):
         exit_code = None
+
+    is_error = payload.get("isError", payload.get("is_error"))
     if (
-        payload.get("is_error") is True
+        is_error is True
         or payload.get("success") is False
+        or outcome in {"error", "failed", "failure", "cancelled"}
         or status in {"error", "failed", "failure", "cancelled"}
         or (exit_code is not None and exit_code != 0)
     ):
         return "failure", exit_code
-    return "success", exit_code
+    if (
+        is_error is False
+        or payload.get("success") is True
+        or outcome in {"success", "succeeded", "completed", "ok"}
+        or status in {"success", "succeeded", "completed", "ok"}
+        or exit_code == 0
+    ):
+        return "success", exit_code
+    return "unknown", exit_code
 
 
 def _raw_arguments(arguments: Any) -> str:
@@ -252,6 +270,8 @@ def paired_tool_actions(
             name, arguments = calls.pop(call_id)
             output = item.get("output")
             outcome, exit_code = _outcome(output)
+            if outcome == "unknown":
+                continue
             action = CheckpointAction(
                 name=name,
                 call_id=call_id,

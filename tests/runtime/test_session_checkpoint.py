@@ -56,8 +56,8 @@ def test_checkpoint_pairs_normalized_tools_and_resumes_at_pull_request() -> None
     assert "Do not repeat the verified git push." in checkpoint.do_not_repeat
 
 
-def test_checkpoint_uses_structured_failure_not_result_prose() -> None:
-    succeeded = build_checkpoint(
+def test_checkpoint_requires_explicit_structured_tool_success() -> None:
+    unverified = build_checkpoint(
         session_id="conv_checkpoint",
         history=[
             {
@@ -70,16 +70,58 @@ def test_checkpoint_uses_structured_failure_not_result_prose() -> None:
         ],
         status="idle",
     )
+    structured_successes = [
+        '{"exit_code":0}',
+        '{"isError":false}',
+        '{"status":"success"}',
+        '{"outcome":"success"}',
+    ]
     failed = build_checkpoint(
         session_id="conv_checkpoint",
         history=_history('{"exit_code": 1, "summary": "push rejected"}'),
         status="failed",
     )
 
-    assert [action.call_id for action in succeeded.verified_actions] == ["tests"]
-    assert succeeded.failed_actions == []
+    assert unverified.verified_actions == []
+    assert unverified.failed_actions == []
+    assert unverified.phase == "answer"
+    assert unverified.do_not_repeat == []
+    for output in structured_successes:
+        checkpoint = build_checkpoint(
+            session_id="conv_checkpoint",
+            history=_history(output),
+            status="idle",
+        )
+        assert checkpoint.phase == "open_pr"
+        assert checkpoint.verified_actions[-1].call_id == "push"
     assert [action.call_id for action in failed.failed_actions] == ["push"]
     assert "exit_code:1" in failed.failed_actions[0].markers
+
+
+def test_checkpoint_records_plain_text_tool_errors_as_failures() -> None:
+    for output in ("fatal: could not push some refs", "error: remote rejected push"):
+        checkpoint = build_checkpoint(
+            session_id="conv_checkpoint",
+            history=[
+                {
+                    "type": "function_call",
+                    "call_id": "push",
+                    "name": "shell",
+                    "arguments": '{"command":"git push origin feature/checkpoint"}',
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "push",
+                    "output": output,
+                },
+            ],
+            status="failed",
+        )
+
+        assert checkpoint.verified_actions == []
+        assert [action.call_id for action in checkpoint.failed_actions] == ["push"]
+        assert checkpoint.phase == "answer"
+        assert checkpoint.do_not_repeat == []
 
 
 def test_checkpoint_retains_recent_workflow_markers_after_long_history() -> None:
@@ -145,6 +187,38 @@ def test_checkpoint_redacts_secrets_and_never_persists_raw_tool_payloads() -> No
         assert secret not in persisted
     assert "[redacted]" in checkpoint.latest_user_directive
     assert checkpoint.verified_actions[0].markers == ["exit_code:0"]
+
+
+def test_checkpoint_redacts_token_only_url_userinfo_in_directives_and_tools() -> None:
+    history = [
+        {
+            "type": "message",
+            "role": "user",
+            "content": "Clone https://directive-token@github.com/example/repository.",
+        },
+        {
+            "type": "function_call",
+            "call_id": "push",
+            "name": "shell",
+            "arguments": '{"command":"git push https://command-token@github.com/example/repository"}',
+        },
+        {
+            "type": "function_call_output",
+            "call_id": "push",
+            "output": (
+                '{"exit_code":0,"remote":'
+                '"https://output-token@github.com/example/repository"}'
+            ),
+        },
+    ]
+
+    checkpoint = build_checkpoint(session_id="conv_checkpoint", history=history, status="idle")
+    persisted = json.dumps(checkpoint.model_dump(mode="json"))
+
+    for token in ("directive-token", "command-token", "output-token"):
+        assert token not in persisted
+    assert "https://[redacted]@github.com/example/repository" in checkpoint.latest_user_directive
+    assert checkpoint.repo == "example/repository"
 
 
 def test_checkpoint_quotes_malicious_directive_as_untrusted_json_data() -> None:

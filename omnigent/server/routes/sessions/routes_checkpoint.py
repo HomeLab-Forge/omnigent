@@ -74,11 +74,11 @@ def register_checkpoint_routes(
 ) -> None:
     """Register isolated framework checkpoint routes."""
 
-    async def _load_authorized_checkpoint(
+    async def _authorized_session_state(
         request: Request,
         session_id: str,
         required_level: int,
-    ) -> SessionCheckpoint | None:
+    ) -> dict[str, Any]:
         user_id = _require_user(request, auth_provider)
         await _require_access(
             user_id,
@@ -90,7 +90,16 @@ def register_checkpoint_routes(
         conversation = await asyncio.to_thread(conversation_store.get_conversation, session_id)
         if conversation is None:
             raise OmnigentError("Conversation not found", code=ErrorCode.NOT_FOUND)
-        raw = conversation.session_state.get(CHECKPOINT_KEY)
+        return dict(conversation.session_state)
+
+    async def _load_authorized_checkpoint(
+        request: Request,
+        session_id: str,
+        required_level: int,
+    ) -> SessionCheckpoint | None:
+        raw = (await _authorized_session_state(request, session_id, required_level)).get(
+            CHECKPOINT_KEY
+        )
         if raw is None:
             return None
         try:
@@ -195,7 +204,7 @@ def register_checkpoint_routes(
                 },
             )
             try:
-                await _load_authorized_checkpoint(request, session_id, LEVEL_EDIT)
+                await _authorized_session_state(request, session_id, LEVEL_EDIT)
                 stored_checkpoint = (
                     checkpoint.model_dump(mode="json") if checkpoint is not None else None
                 )

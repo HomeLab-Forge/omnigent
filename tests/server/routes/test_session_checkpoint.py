@@ -95,6 +95,37 @@ async def test_checkpoint_api_rejects_cross_session_payload(
     assert response.status_code == 400
 
 
+async def test_checkpoint_write_replaces_malformed_legacy_state(
+    client: httpx.AsyncClient,
+    checkpoint_session_id: str,
+    db_uri: str,
+) -> None:
+    """A valid replacement repairs an older checkpoint shape."""
+    conversations = SqlAlchemyConversationStore(db_uri)
+    conversations.set_session_state(
+        checkpoint_session_id,
+        {
+            "policy.keep": {"mode": "enforce"},
+            "_framework_checkpoint_v1": {
+                "version": 0,
+                "arguments": "legacy raw state",
+            },
+        },
+    )
+
+    response = await client.put(
+        f"/v1/sessions/{checkpoint_session_id}/checkpoint",
+        json={"checkpoint": _checkpoint(checkpoint_session_id)},
+    )
+
+    assert response.status_code == 200
+    conversation = conversations.get_conversation(checkpoint_session_id)
+    assert conversation is not None
+    assert conversation.session_state["policy.keep"] == {"mode": "enforce"}
+    assert conversation.session_state["_framework_checkpoint_v1"]["version"] == 1
+    assert "arguments" not in conversation.session_state["_framework_checkpoint_v1"]
+
+
 async def test_checkpoint_write_preserves_concurrent_unrelated_session_state(
     client: httpx.AsyncClient,
     checkpoint_session_id: str,
@@ -129,7 +160,7 @@ async def test_checkpoint_route_records_tool_observation_attributes(
     checkpoint_session_id: str,
     monkeypatch: Any,
 ) -> None:
-    """Checkpoint reads expose Langfuse tool attributes and session identity."""
+    """Checkpoint writes redact captured tool-observation payloads."""
     attributes: dict[str, Any] = {}
 
     class _Span:
@@ -148,7 +179,9 @@ async def test_checkpoint_route_records_tool_observation_attributes(
     monkeypatch.setattr(routes_checkpoint.telemetry, "should_capture_content", lambda: True)
 
     payload = _checkpoint(checkpoint_session_id)
-    payload["latest_user_directive"] = "Use https://user:trace-secret@example.test?token=query-secret"
+    payload["latest_user_directive"] = (
+        "Use https://trace-token@github.com/example/repository"
+    )
     response = await client.put(
         f"/v1/sessions/{checkpoint_session_id}/checkpoint",
         json={"checkpoint": payload},
@@ -161,6 +194,5 @@ async def test_checkpoint_route_records_tool_observation_attributes(
     assert attributes["checkpoint.outcome"] == "success"
     assert attributes["checkpoint.covered_item_count"] == 1
     assert attributes["checkpoint.latency_ms"] >= 0
-    assert "trace-secret" not in attributes["input.value"]
-    assert "query-secret" not in attributes["input.value"]
+    assert "trace-token" not in attributes["input.value"]
     assert "[redacted]" in attributes["input.value"]

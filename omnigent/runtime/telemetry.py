@@ -138,7 +138,7 @@ _SECRET_ASSIGNMENT_RE = re.compile(
 _SECRET_QUERY_RE = re.compile(
     rf"(?i)(?P<prefix>[?&](?:{'|'.join(_REDACT_KEY_SUBSTRINGS)})=)(?P<value>[^&#\s]+)"
 )
-_URL_USERINFO_RE = re.compile(r"(?i)(https?://)([^/@\s:]+):([^/@\s]+)@")
+_URL_USERINFO_RE = re.compile(r"(?i)(https?://)[^/@\s]+@")
 _BEARER_RE = re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]+")
 
 
