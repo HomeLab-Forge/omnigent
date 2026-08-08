@@ -172,6 +172,18 @@ def test_checkpoint_verifies_strong_raw_bash_git_output_only() -> None:
         ],
         status="idle",
     )
+    no_op_push = build_checkpoint(
+        session_id="conv_checkpoint",
+        history=[
+            history[-2],
+            {
+                "type": "function_call_output",
+                "call_id": "push",
+                "output": "Everything up-to-date",
+            },
+        ],
+        status="idle",
+    )
 
     assert checkpoint.phase == "open_pr"
     assert [action.call_id for action in checkpoint.verified_actions] == [
@@ -181,6 +193,8 @@ def test_checkpoint_verifies_strong_raw_bash_git_output_only() -> None:
     ]
     assert unknown.verified_actions == []
     assert unknown.phase == "answer"
+    assert no_op_push.phase == "open_pr"
+    assert [action.call_id for action in no_op_push.verified_actions] == ["push"]
 
 
 def test_checkpoint_verifies_mcp_results_and_rejects_mcp_failures() -> None:

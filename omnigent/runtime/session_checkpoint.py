@@ -192,7 +192,7 @@ def _raw_bash_success(name: str, arguments: Any, output: str) -> bool:
                 output,
             )
             or re.search(r"(?mi)^\s*\*\s+\[new branch\]\s+.+\s+->\s+.+$", output)
-            or "everything up-to-date." in output.lower()
+            or bool(re.search(r"(?i)\beverything up-to-date(?:[.!])?(?:\s|$)", output))
         )
     if re.search(r"\bgit\s+commit\b", command):
         return bool(re.search(r"(?m)^\[[^\]\r\n]+\s[0-9a-f]{7,40}\]", output))
