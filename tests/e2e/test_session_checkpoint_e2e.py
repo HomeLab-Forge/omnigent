@@ -69,13 +69,27 @@ def _run_turn(
         with httpx.Client(base_url=base_url, timeout=30) as poster:
             send_user_message_to_session(poster, session_id=session_id, content=content, tools=_TOOLS)
 
-    def post_tool_output(call_id: str) -> None:
+    def post_tool_output(call_id: str, name: str, arguments: str) -> None:
+        command = json.loads(arguments or "{}").get("command", "")
+        if name == "Bash" and "git switch" in command:
+            output = "Switched to a new branch 'feature/checkpoint'"
+        elif name == "Bash" and "git commit" in command:
+            output = "[feature/checkpoint abc1234] checkpoint"
+        elif name == "Bash" and "git push" in command:
+            output = (
+                "To github.com:example/repository\n"
+                " * [new branch]      feature/checkpoint -> feature/checkpoint"
+            )
+        elif name == "github__create_pull_request":
+            output = '{"url":"https://github.com/example/repository/pull/42","number":42}'
+        else:
+            output = "Error: unexpected tool call"
         with httpx.Client(base_url=base_url, timeout=30) as poster:
             response = poster.post(
                 f"/v1/sessions/{session_id}/events",
                 json={
                     "type": "function_call_output",
-                    "data": {"call_id": call_id, "output": '{"exit_code":0}'},
+                    "data": {"call_id": call_id, "output": output},
                 },
             )
             assert response.status_code in (200, 202), response.text[:300]
@@ -93,8 +107,13 @@ def _run_turn(
                 if item.get("type") == "function_call" and item.get("status") == "action_required":
                     call_id = item.get("call_id")
                     if isinstance(call_id, str):
-                        calls.append(str(item.get("name")))
-                        threading.Thread(target=post_tool_output, args=(call_id,), daemon=True).start()
+                        name = str(item.get("name"))
+                        calls.append(name)
+                        threading.Thread(
+                            target=post_tool_output,
+                            args=(call_id, name, str(item.get("arguments") or "")),
+                            daemon=True,
+                        ).start()
             elif event.get("type") == "response.completed":
                 completed = True
                 break
@@ -210,3 +229,16 @@ def test_checkpoint_resumes_pull_request_via_live_server_and_runner(
     assert "git switch -c feature/checkpoint" not in model_input
     assert "git commit -m checkpoint" not in model_input
     assert "git push origin feature/checkpoint" not in model_input
+
+    checkpoint_response = http_client.get(f"/v1/sessions/{session_id}/checkpoint")
+    deadline = time.monotonic() + 10
+    while (
+        checkpoint_response.status_code == 200
+        and (checkpoint_response.json().get("checkpoint") or {}).get("phase") != "complete"
+        and time.monotonic() < deadline
+    ):
+        time.sleep(0.1)
+        checkpoint_response = http_client.get(f"/v1/sessions/{session_id}/checkpoint")
+    final_checkpoint = checkpoint_response.json()["checkpoint"]
+    assert final_checkpoint["phase"] == "complete"
+    assert final_checkpoint["pr_url"] == "https://github.com/example/repository/pull/42"

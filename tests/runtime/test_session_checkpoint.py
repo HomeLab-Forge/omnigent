@@ -124,6 +124,161 @@ def test_checkpoint_records_plain_text_tool_errors_as_failures() -> None:
         assert checkpoint.do_not_repeat == []
 
 
+def test_checkpoint_verifies_strong_raw_bash_git_output_only() -> None:
+    history = [
+        {
+            "type": "function_call",
+            "call_id": "branch",
+            "name": "Bash",
+            "arguments": '{"command":"git switch -c feature/checkpoint"}',
+        },
+        {
+            "type": "function_call_output",
+            "call_id": "branch",
+            "output": "Switched to a new branch 'feature/checkpoint'",
+        },
+        {
+            "type": "function_call",
+            "call_id": "commit",
+            "name": "Bash",
+            "arguments": '{"command":"git commit -m checkpoint"}',
+        },
+        {
+            "type": "function_call_output",
+            "call_id": "commit",
+            "output": "[feature/checkpoint abc1234] checkpoint",
+        },
+        {
+            "type": "function_call",
+            "call_id": "push",
+            "name": "Bash",
+            "arguments": '{"command":"git push origin feature/checkpoint"}',
+        },
+        {
+            "type": "function_call_output",
+            "call_id": "push",
+            "output": (
+                "To github.com:example/repository\n"
+                " * [new branch]      feature/checkpoint -> feature/checkpoint"
+            ),
+        },
+    ]
+    checkpoint = build_checkpoint(session_id="conv_checkpoint", history=history, status="idle")
+    unknown = build_checkpoint(
+        session_id="conv_checkpoint",
+        history=[
+            history[-2],
+            {"type": "function_call_output", "call_id": "push", "output": "pushed"},
+        ],
+        status="idle",
+    )
+
+    assert checkpoint.phase == "open_pr"
+    assert [action.call_id for action in checkpoint.verified_actions] == [
+        "branch",
+        "commit",
+        "push",
+    ]
+    assert unknown.verified_actions == []
+    assert unknown.phase == "answer"
+
+
+def test_checkpoint_verifies_mcp_results_and_rejects_mcp_failures() -> None:
+    success = build_checkpoint(
+        session_id="conv_checkpoint",
+        history=[
+            {
+                "type": "function_call",
+                "call_id": "pr",
+                "name": "github__create_pull_request",
+                "arguments": "{}",
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "pr",
+                "output": '{"url":"https://github.com/example/repository/pull/42","number":42}',
+            },
+        ],
+        status="idle",
+    )
+    text_success = build_checkpoint(
+        session_id="conv_checkpoint",
+        history=[
+            {
+                "type": "function_call",
+                "call_id": "pr-text",
+                "name": "github__create_pull_request",
+                "arguments": "{}",
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "pr-text",
+                "output": "Created pull request #43",
+            },
+        ],
+        status="idle",
+    )
+    failure = build_checkpoint(
+        session_id="conv_checkpoint",
+        history=[
+            {
+                "type": "function_call",
+                "call_id": "pr-failed",
+                "name": "github__create_pull_request",
+                "arguments": "{}",
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "pr-failed",
+                "output": '{"error":"runner MCP dispatch failed"}',
+            },
+        ],
+        status="failed",
+    )
+    failure_envelope = build_checkpoint(
+        session_id="conv_checkpoint",
+        history=[
+            {
+                "type": "function_call",
+                "call_id": "pr-envelope",
+                "name": "github__create_pull_request",
+                "arguments": "{}",
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "pr-envelope",
+                "output": "Error: RuntimeError: MCP server unavailable",
+            },
+        ],
+        status="failed",
+    )
+    explicit_error = build_checkpoint(
+        session_id="conv_checkpoint",
+        history=[
+            {
+                "type": "function_call",
+                "call_id": "pr-is-error",
+                "name": "github__create_pull_request",
+                "arguments": "{}",
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "pr-is-error",
+                "output": '{"isError":true,"content":"permission denied"}',
+            },
+        ],
+        status="failed",
+    )
+
+    assert success.phase == "complete"
+    assert success.pr_url == "https://github.com/example/repository/pull/42"
+    assert text_success.phase == "complete"
+    assert [action.call_id for action in failure.failed_actions] == ["pr-failed"]
+    assert failure.phase == "answer"
+    assert [action.call_id for action in failure_envelope.failed_actions] == ["pr-envelope"]
+    assert [action.call_id for action in explicit_error.failed_actions] == ["pr-is-error"]
+
+
 def test_checkpoint_retains_recent_workflow_markers_after_long_history() -> None:
     history: list[dict[str, object]] = []
     for index in range(40):

@@ -164,40 +164,89 @@ def _decode_output(output: Any) -> Mapping[str, Any]:
     return {}
 
 
-def _outcome(output: Any) -> tuple[Literal["success", "failure", "unknown"], int | None]:
+def _is_mcp_tool(name: str) -> bool:
+    """Return whether a namespaced tool name belongs to an MCP server."""
+    prefix, separator, bare_name = name.partition("__")
+    return bool(prefix and separator and bare_name)
+
+
+def _is_pull_request_tool(name: str) -> bool:
+    """Return whether a namespaced MCP tool creates a pull request."""
+    return name == "create_pull_request" or name.endswith("__create_pull_request")
+
+
+def _is_runner_failure_text(text: str) -> bool:
+    """Return whether a runner or MCP error envelope prefixes the result."""
+    return bool(re.match(r"^\s*(?:error|fatal)\s*:", text, re.IGNORECASE))
+
+
+def _raw_bash_success(name: str, arguments: Any, output: str) -> bool:
+    """Recognize the success lines emitted by the client coding Bash tool."""
+    if name.lower() not in {"bash", "shell"}:
+        return False
+    command = _raw_arguments(arguments).lower()
+    if re.search(r"\bgit\s+push\b", command):
+        return bool(
+            re.search(
+                r"(?m)^\s*[0-9a-f]{7,40}\.\.[0-9a-f]{7,40}\s+.+\s+->\s+.+$",
+                output,
+            )
+            or re.search(r"(?mi)^\s*\*\s+\[new branch\]\s+.+\s+->\s+.+$", output)
+            or "everything up-to-date." in output.lower()
+        )
+    if re.search(r"\bgit\s+commit\b", command):
+        return bool(re.search(r"(?m)^\[[^\]\r\n]+\s[0-9a-f]{7,40}\]", output))
+    if re.search(r"\bgit\s+(?:checkout\s+-b|switch\s+-c)\b", command):
+        return bool(re.search(r"(?i)\bswitched to a new branch\b", output))
+    return False
+
+
+def _outcome(
+    name: str,
+    arguments: Any,
+    output: Any,
+) -> tuple[Literal["success", "failure", "unknown"], int | None]:
     payload = _decode_output(output)
-    if not payload:
-        text = output.lower() if isinstance(output, str) else ""
-        if re.search(r"\b(?:fatal|error)\b", text):
+    if payload:
+        status = str(payload.get("status", "")).lower()
+        outcome = str(payload.get("outcome", "")).lower()
+        exit_code = payload.get("exit_code")
+        try:
+            exit_code = int(exit_code) if exit_code is not None else None
+        except (TypeError, ValueError):
+            exit_code = None
+        is_error = payload.get("isError", payload.get("is_error"))
+        error = payload.get("error")
+        if (
+            is_error is True
+            or payload.get("success") is False
+            or error not in (None, False, "", {}, [])
+            or outcome in {"error", "failed", "failure", "cancelled"}
+            or status in {"error", "failed", "failure", "cancelled"}
+            or (exit_code is not None and exit_code != 0)
+        ):
+            return "failure", exit_code
+        if (
+            is_error is False
+            or payload.get("success") is True
+            or outcome in {"success", "succeeded", "completed", "ok"}
+            or status in {"success", "succeeded", "completed", "ok"}
+            or exit_code == 0
+            or _is_mcp_tool(name)
+        ):
+            return "success", exit_code
+        return "unknown", exit_code
+
+    text = output if isinstance(output, str) else ""
+    if _is_runner_failure_text(text):
+        return "failure", None
+    if _is_mcp_tool(name):
+        return "success", None
+    if name.lower() in {"bash", "shell"}:
+        if re.search(r"\b(?:fatal|error)\b", text, re.IGNORECASE):
             return "failure", None
-        return "unknown", None
-
-    status = str(payload.get("status", "")).lower()
-    outcome = str(payload.get("outcome", "")).lower()
-    exit_code = payload.get("exit_code")
-    try:
-        exit_code = int(exit_code) if exit_code is not None else None
-    except (TypeError, ValueError):
-        exit_code = None
-
-    is_error = payload.get("isError", payload.get("is_error"))
-    if (
-        is_error is True
-        or payload.get("success") is False
-        or outcome in {"error", "failed", "failure", "cancelled"}
-        or status in {"error", "failed", "failure", "cancelled"}
-        or (exit_code is not None and exit_code != 0)
-    ):
-        return "failure", exit_code
-    if (
-        is_error is False
-        or payload.get("success") is True
-        or outcome in {"success", "succeeded", "completed", "ok"}
-        or status in {"success", "succeeded", "completed", "ok"}
-        or exit_code == 0
-    ):
-        return "success", exit_code
-    return "unknown", exit_code
+        return ("success" if _raw_bash_success(name, arguments, text) else "unknown"), None
+    return "unknown", None
 
 
 def _raw_arguments(arguments: Any) -> str:
@@ -215,7 +264,7 @@ def _markers(name: str, arguments: Any, output: Any, exit_code: int | None) -> l
     markers: list[str] = []
     if exit_code is not None:
         markers.append(f"exit_code:{exit_code}")
-    if name == "github__create_pull_request":
+    if _is_pull_request_tool(name):
         markers.append("pull_request_created")
     if re.search(r"\bgit\s+push\b", text):
         markers.append("git_push")
@@ -269,7 +318,7 @@ def paired_tool_actions(
         elif item.get("type") == "function_call_output" and call_id in calls:
             name, arguments = calls.pop(call_id)
             output = item.get("output")
-            outcome, exit_code = _outcome(output)
+            outcome, exit_code = _outcome(name, arguments, output)
             if outcome == "unknown":
                 continue
             action = CheckpointAction(
@@ -307,7 +356,7 @@ def paired_tool_actions(
 def _phase_for_actions(actions: Sequence[CheckpointAction]) -> CheckpointPhase:
     markers = {marker for action in actions for marker in action.markers}
     names = {action.name for action in actions}
-    if "pull_request_created" in markers or "github__create_pull_request" in names:
+    if "pull_request_created" in markers or any(_is_pull_request_tool(name) for name in names):
         return "complete"
     if "git_push" in markers:
         return "open_pr"
