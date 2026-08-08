@@ -23,6 +23,7 @@ import time
 import urllib.parse
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, Protocol, TypeAlias, cast, overload
 
@@ -140,9 +141,17 @@ from omnigent.runner.session_init_protocol import (
 from omnigent.runtime.harnesses.process_manager import HarnessProcessManager, NoLiveHarnessError
 from omnigent.runtime.prompt import (
     SHARED_SESSION_AUTHORSHIP_INSTRUCTION,
+    append_framework_instructions,
     input_items_have_multiple_authors,
     prepare_input_items_for_model,
     shared_message_attribution_enabled,
+)
+from omnigent.runtime.session_checkpoint import (
+    SessionCheckpoint,
+    build_checkpoint,
+    checkpoint_instruction,
+    latest_user_directive,
+    prune_covered_history,
 )
 from omnigent.server.schemas import (
     BackgroundSessionTitleRequest,
@@ -2023,6 +2032,103 @@ def create_runner_app(
     app.state.session_event_queues = _session_event_queues
     _session_inboxes = _session_inboxes_ref
     _session_async_tasks: dict[str, dict[str, tuple[asyncio.Task[str], asyncio.Event]]] = {}
+    _checkpoint_enabled_sessions: set[str] = set()
+    _checkpoint_turn_status: dict[str, Literal["idle", "failed", "cancelled"]] = {}
+    app.state.checkpoint_turn_status = _checkpoint_turn_status
+
+    async def _read_session_checkpoint(session_id: str) -> SessionCheckpoint | None:
+        try:
+            response = await server_client.get(
+                f"/v1/sessions/{session_id}/checkpoint",
+                timeout=2.0,
+            )
+            if response.status_code == 404:
+                return None
+            if response.status_code != 200:
+                _logger.warning(
+                    "Checkpoint read returned %s for session=%s",
+                    response.status_code,
+                    session_id,
+                )
+                return None
+            payload = response.json().get("checkpoint")
+            return SessionCheckpoint.model_validate(payload) if payload is not None else None
+        except Exception:
+            _logger.warning("Checkpoint read failed for session=%s", session_id, exc_info=True)
+            return None
+
+    async def _write_session_checkpoint(checkpoint: SessionCheckpoint) -> None:
+        try:
+            response = await server_client.put(
+                f"/v1/sessions/{checkpoint.session_id}/checkpoint",
+                json={"checkpoint": checkpoint.model_dump(mode="json")},
+                timeout=2.0,
+            )
+            if response.status_code != 200:
+                _logger.warning(
+                    "Checkpoint write returned %s for session=%s",
+                    response.status_code,
+                    checkpoint.session_id,
+                )
+        except Exception:
+            _logger.warning(
+                "Checkpoint write failed for session=%s",
+                checkpoint.session_id,
+                exc_info=True,
+            )
+
+    async def _checkpoint_for_turn(
+        session_id: str,
+        harness_name: str | None,
+        history: list[_JsonObject],
+    ) -> tuple[SessionCheckpoint | None, list[_JsonObject]]:
+        if is_native_harness(harness_name):
+            return None, history
+        _checkpoint_enabled_sessions.add(session_id)
+        checkpoint = await _read_session_checkpoint(session_id)
+        if checkpoint is None:
+            return None, history
+        checkpoint = checkpoint.model_copy(
+            update={
+                "latest_user_directive": latest_user_directive(history),
+                "status": "active",
+                "updated_at": datetime.now(UTC).isoformat(),
+            }
+        )
+        await _write_session_checkpoint(checkpoint)
+        return checkpoint, cast(list[_JsonObject], prune_covered_history(checkpoint, history))
+
+    async def _persist_session_checkpoint(session_id: str) -> None:
+        if session_id not in _checkpoint_enabled_sessions:
+            return
+        status = _checkpoint_turn_status.pop(session_id, None)
+        if status is None:
+            return
+        try:
+            checkpoint = build_checkpoint(
+                session_id=session_id,
+                history=_session_histories.get(session_id, []),
+                status=status,
+            )
+            await _write_session_checkpoint(checkpoint)
+        except Exception:
+            _logger.warning(
+                "Checkpoint persistence failed for session=%s",
+                session_id,
+                exc_info=True,
+            )
+
+    def _schedule_checkpoint_persist(session_id: str) -> None:
+        task = asyncio.create_task(
+            _persist_session_checkpoint(session_id),
+            name=f"checkpoint-{session_id}",
+        )
+        _background_tasks.add(task)
+        task.add_done_callback(_background_tasks.discard)
+
+    app.state.checkpoint_for_turn = _checkpoint_for_turn
+    app.state.persist_session_checkpoint = _persist_session_checkpoint
+    app.state.session_histories = _session_histories
 
     def _has_active_work() -> bool:
         if _active_turns:
@@ -3307,6 +3413,8 @@ def create_runner_app(
         if _relay := _session_comment_relays.pop(session_id, None):
             _relay.close()
         _session_histories.pop(session_id, None)
+        _checkpoint_enabled_sessions.discard(session_id)
+        _checkpoint_turn_status.pop(session_id, None)
         _author_attribution_sessions.discard(session_id)
         _last_server_item_id.pop(session_id, None)
         _session_event_queues.pop(session_id, None)
@@ -5379,6 +5487,7 @@ def create_runner_app(
             # its handler is never shadowed by the generic except below.
             raise
         except asyncio.CancelledError as exc:
+            _checkpoint_turn_status[conv] = "cancelled"
             _logger.error(
                 "turn cancelled for %s: %s",
                 conv,
@@ -5388,6 +5497,7 @@ def create_runner_app(
             _on_proxy_stream_end(conv, error={"message": f"turn setup failed: {exc}"})
             raise
         except Exception as exc:
+            _checkpoint_turn_status[conv] = "failed"
             _logger.error(
                 "turn setup failed for %s: %s",
                 conv,
@@ -5396,6 +5506,7 @@ def create_runner_app(
             )
             _on_proxy_stream_end(conv, error={"message": f"turn setup failed: {exc}"})
         finally:
+            _schedule_checkpoint_persist(conv)
             # Permanent-wedge floor: guarantee _active_turns is never left stale,
             # however the body exits — including a BaseException that escapes
             # ``except Exception``. A setup-phase abnormal exit otherwise leaves
@@ -5514,6 +5625,13 @@ def create_runner_app(
             _session_histories[conv]
         ):
             _author_attribution_sessions.add(conv)
+        checkpoint, checkpoint_history = await _checkpoint_for_turn(
+            conv,
+            harness_name,
+            _session_histories[conv],
+        )
+        if conv in _checkpoint_enabled_sessions:
+            _checkpoint_turn_status[conv] = "idle"
         if cached_spec is not None:
             spawn_env = _build_spawn_env_from_spec(
                 cached_spec,
@@ -5524,10 +5642,16 @@ def create_runner_app(
             )
             from omnigent.runtime.prompt import build_instructions
 
-            framework_instructions = (
-                (SHARED_SESSION_AUTHORSHIP_INSTRUCTION,)
-                if shared_message_attribution_enabled() and conv in _author_attribution_sessions
-                else ()
+            framework_instructions = tuple(
+                instruction
+                for instruction in (
+                    SHARED_SESSION_AUTHORSHIP_INSTRUCTION
+                    if shared_message_attribution_enabled()
+                    and conv in _author_attribution_sessions
+                    else None,
+                    checkpoint_instruction(checkpoint) if checkpoint is not None else None,
+                )
+                if instruction is not None
             )
             instructions = build_instructions(
                 cached_spec,
@@ -5552,8 +5676,8 @@ def create_runner_app(
             "role": "user",
             "model": msg_body.get("model", ""),
         }
-        if _session_histories[conv]:
-            history = _session_histories[conv]
+        if checkpoint_history:
+            history = checkpoint_history
             if any("created_by" in item for item in history):
                 harness_body["content"] = prepare_input_items_for_model(
                     history,
@@ -5733,6 +5857,7 @@ def create_runner_app(
         if isinstance(response, StreamingResponse):
             await _drain_streaming_response(response, conv)
         else:
+            _checkpoint_turn_status[conv] = "failed"
             err_detail = "harness returned error response"
             if hasattr(response, "body"):
                 with contextlib.suppress(
@@ -6102,6 +6227,7 @@ def create_runner_app(
                                         )
                                         _text_acc.clear()
                                 elif _evt_type == "response.failed":
+                                    _checkpoint_turn_status[conv_id] = "failed"
                                     _err = event.get("error") or (event.get("response") or {}).get(
                                         "error"
                                     )
@@ -6290,11 +6416,13 @@ def create_runner_app(
                     if _dispatch_tasks:
                         await _asyncio.gather(*_dispatch_tasks, return_exceptions=True)
 
+                    await _persist_session_checkpoint(conv_id)
                     _on_proxy_stream_end(
                         conv_id, error=_stream_failed_error, owner_response_id=_response_id
                     )
 
             except _ContextWindowOverflow as overflow:
+                _checkpoint_turn_status[conv_id] = "failed"
                 _error = {
                     "code": "context_length_exceeded",
                     "message": (
@@ -6313,6 +6441,7 @@ def create_runner_app(
                 yield _response_failed_event(_error)
 
             except (httpx.HTTPError, RuntimeError) as exc:
+                _checkpoint_turn_status[conv_id] = "failed"
                 _logger.warning(
                     "proxy stream connection error for %s: %s",
                     conv_id,
@@ -6490,12 +6619,44 @@ def create_runner_app(
                 _publish_turn_status(conversation_id, "running")
 
                 if stream:
+                    checkpoint, checkpoint_history = await _checkpoint_for_turn(
+                        conversation_id,
+                        cast(str | None, message_body.get("harness")),
+                        _session_histories[conversation_id],
+                    )
+                    if conversation_id in _checkpoint_enabled_sessions:
+                        _checkpoint_turn_status[conversation_id] = "idle"
+                    if checkpoint is not None:
+                        message_body["content"] = checkpoint_history
+                        message_body["instructions"] = append_framework_instructions(
+                            cast(str | None, message_body.get("instructions")),
+                            (checkpoint_instruction(checkpoint),),
+                        )
                     response = await _stream_message_to_harness(message_body, conversation_id)
-                    if not isinstance(response, StreamingResponse):
+                    if isinstance(response, StreamingResponse):
+                        source = response.body_iterator
+
+                        async def _checkpointed_stream() -> AsyncIterator[bytes]:
+                            try:
+                                async for chunk in source:
+                                    yield chunk
+                            except asyncio.CancelledError:
+                                _checkpoint_turn_status[conversation_id] = "cancelled"
+                                raise
+                            except Exception:
+                                _checkpoint_turn_status[conversation_id] = "failed"
+                                raise
+                            finally:
+                                _schedule_checkpoint_persist(conversation_id)
+
+                        response.body_iterator = _checkpointed_stream()
+                    else:
+                        _checkpoint_turn_status[conversation_id] = "failed"
                         _on_proxy_stream_end(
                             conversation_id,
                             error={"message": "harness returned error response"},
                         )
+                        _schedule_checkpoint_persist(conversation_id)
                     return response
 
                 _turn_task = asyncio.create_task(
