@@ -120,9 +120,9 @@ _MCP_TOOL_NAME_PREFIX = "mcp__"
 def _is_terminal_tool_budget_reason(value: object) -> bool:
     if not isinstance(value, str):
         return False
-    return ("Stopped after " in value and "failed tool calls in this turn" in value) or (
-        "Exceeded the " in value and "-tool budget for this turn" in value
-    )
+    return (
+        "Stopped after " in value and "failed tool calls" in value and "in this turn" in value
+    ) or ("Exceeded the " in value and "-tool budget for this turn" in value)
 
 
 def _is_terminal_tool_budget_result(result: dict[str, Any]) -> bool:

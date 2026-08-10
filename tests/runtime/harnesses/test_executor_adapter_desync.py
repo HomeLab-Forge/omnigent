@@ -185,8 +185,8 @@ async def test_terminal_tool_budget_denial_cancels_active_turn(
         del args, kwargs
         return {
             "error": (
-                "Denied by policy: Stopped after 2 failed tool calls in this "
-                "turn. Read the errors and report the blocker."
+                "Denied by policy: Stopped after 2 consecutive failed tool "
+                "calls in this turn. Read the errors and report the blocker."
             )
         }
 
@@ -201,7 +201,7 @@ async def test_terminal_tool_budget_denial_cancels_active_turn(
         {"command": "git status"},
     )
 
-    assert "Stopped after 2 failed tool calls" in result["error"]
+    assert "Stopped after 2 consecutive failed tool calls" in result["error"]
     assert ctx.cancelled.is_set()
 
 
