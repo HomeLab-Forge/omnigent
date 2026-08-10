@@ -26,8 +26,10 @@ from omnigent.inner.executor import (
     Executor,
     ExecutorConfig,
     ExecutorEvent,
+    LLMCallComplete,
     Message,
     TextChunk,
+    ToolCallRequest,
     ToolSpec,
     TurnComplete,
 )
@@ -176,10 +178,10 @@ async def test_orphan_tool_callback_safe_fails() -> None:
     assert adapter._orphan_callback_count == 1
 
 
-async def test_terminal_tool_budget_denial_cancels_active_turn(
+async def test_terminal_tool_budget_denial_requests_final_handoff(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A bridged budget denial stops the generation instead of feeding a loop."""
+    """A bridged budget denial marks the active turn for one final handoff."""
 
     async def _deny(*args: Any, **kwargs: Any) -> dict[str, Any]:
         del args, kwargs
@@ -202,7 +204,8 @@ async def test_terminal_tool_budget_denial_cancels_active_turn(
     )
 
     assert "Stopped after 2 consecutive failed tool calls" in result["error"]
-    assert ctx.cancelled.is_set()
+    assert adapter._terminal_tool_budget_ctx is ctx
+    assert not ctx.cancelled.is_set()
 
 
 async def test_nonterminal_policy_denial_keeps_turn_active(
@@ -230,13 +233,14 @@ async def test_nonterminal_policy_denial_keeps_turn_active(
         {"command": "git commit -m bad"},
     )
 
+    assert adapter._terminal_tool_budget_ctx is None
     assert not ctx.cancelled.is_set()
 
 
-async def test_native_tool_budget_denial_cancels_active_turn(
+async def test_native_tool_budget_denial_requests_final_handoff(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The native-tool policy bridge applies the same terminal budget behavior."""
+    """The native-tool policy bridge requests the same final handoff."""
     adapter = ExecutorAdapter(executor_factory=_FakeExecutor)
     ctx = _ctx("resp_native_budget")
     adapter._current_ctx = ctx
@@ -262,7 +266,44 @@ async def test_native_tool_budget_denial_cancels_active_turn(
         {"name": "read", "arguments": {}},
     )
 
-    assert ctx.cancelled.is_set()
+    assert adapter._terminal_tool_budget_ctx is ctx
+    assert not ctx.cancelled.is_set()
+
+
+async def test_terminal_budget_summary_ends_turn_before_more_tools() -> None:
+    """A summary after budget exhaustion completes the turn before another tool."""
+    ctx = _ctx("resp_budget_handoff")
+    adapter: ExecutorAdapter | None = None
+
+    def _mark_budget_exhausted() -> None:
+        assert adapter is not None
+        adapter._terminal_tool_budget_ctx = ctx
+
+    executor = _FakeExecutor(
+        events=[
+            TextChunk(text="Done: inspected the PR. Need from you: retry this turn."),
+            LLMCallComplete(
+                model="qwen",
+                response="Done: inspected the PR. Need from you: retry this turn.",
+            ),
+            ToolCallRequest(name="sys_os_read", args={"path": "README.md"}),
+        ],
+        on_iter=_mark_budget_exhausted,
+    )
+    adapter = ExecutorAdapter(executor_factory=lambda: executor)
+
+    await adapter.run_turn(_request(), ctx)
+
+    emitted = []
+    while not ctx._event_queue.empty():
+        emitted.append(ctx._event_queue.get_nowait())
+    assert any(getattr(event, "type", None) == "response.output_text.delta" for event in emitted)
+    assert not any(
+        getattr(event, "type", None) == "response.output_item.done" for event in emitted
+    )
+    assert executor.interrupt_calls == [adapter._session_key]
+    assert not ctx.cancelled.is_set()
+    assert adapter._terminal_tool_budget_ctx is None
 
 
 async def test_watchdog_resync_is_idempotent() -> None:

@@ -269,6 +269,9 @@ class ExecutorAdapter(HarnessApp):
         # deliver.
         self._current_ctx: TurnContext | None = None
         self._current_agent: str | None = None
+        # A terminal budget denial grants the model one final assistant
+        # message for its handoff, then ends the turn before another tool.
+        self._terminal_tool_budget_ctx: TurnContext | None = None
         # FIFO queue of inner-SDK tool-use ids, one entry per
         # ToolCallRequest the executor parses. Populated by
         # :meth:`_translate_event` whenever ``event.metadata``
@@ -399,6 +402,7 @@ class ExecutorAdapter(HarnessApp):
             executor._policy_evaluator = self._stable_policy_evaluator  # type: ignore[attr-defined]
         self._current_ctx = ctx
         self._current_agent = request.model
+        self._terminal_tool_budget_ctx = None
         # Reset the MCP call-id queue at turn start. A prior turn
         # that errored mid-stream (e.g. cancelled while a tool_use
         # block had been parsed but its MCP-handler hadn't fired
@@ -572,6 +576,7 @@ class ExecutorAdapter(HarnessApp):
                         )
 
                 response_text: str | None = None
+                budget_handoff_text_seen = False
                 async for event in executor.run_turn(
                     messages=messages,
                     tools=tools,
@@ -598,6 +603,30 @@ class ExecutorAdapter(HarnessApp):
                         # fallback still fires (P0.2). Setting clean_exit before
                         # the await would skip the fallback on a failed inline
                         # interrupt, leaving the generation abandoned.
+                        await executor.interrupt_session(self._session_key)
+                        clean_exit = True
+                        return
+                    budget_handoff_active = self._terminal_tool_budget_ctx is ctx
+                    if budget_handoff_active and isinstance(event, TextChunk):
+                        if event.text.strip():
+                            budget_handoff_text_seen = True
+                    if budget_handoff_active and isinstance(event, LLMCallComplete):
+                        if (
+                            not budget_handoff_text_seen
+                            and isinstance(event.response, str)
+                            and event.response.strip()
+                        ):
+                            ctx.emit(
+                                OutputTextDeltaEvent(
+                                    type="response.output_text.delta",
+                                    delta=event.response,
+                                )
+                            )
+                            budget_handoff_text_seen = True
+                    if budget_handoff_active and isinstance(event, ToolCallRequest):
+                        if budget_handoff_text_seen:
+                            continue
+                        ctx.cancelled.set()
                         await executor.interrupt_session(self._session_key)
                         clean_exit = True
                         return
@@ -666,6 +695,20 @@ class ExecutorAdapter(HarnessApp):
                                 )
                     # --- End tracing ---
                     self._translate_event(event, ctx)
+                    if (
+                        self._terminal_tool_budget_ctx is ctx
+                        and isinstance(event, LLMCallComplete)
+                        and budget_handoff_text_seen
+                    ):
+                        _logger.warning(
+                            "tool budget handoff completed for response %s; "
+                            "ending the active generation",
+                            ctx.response_id,
+                        )
+                        self._terminal_tool_budget_ctx = None
+                        await executor.interrupt_session(self._session_key)
+                        clean_exit = True
+                        return
                     if isinstance(event, TurnComplete):
                         if tctx is not None and agent_span is not None:
                             _end_tool_trace(error="tool call did not complete before turn end")
@@ -784,6 +827,8 @@ class ExecutorAdapter(HarnessApp):
             if self._current_ctx is ctx:
                 self._current_ctx = None
                 self._current_agent = None
+            if self._terminal_tool_budget_ctx is ctx:
+                self._terminal_tool_budget_ctx = None
             # P0.2: on an abnormal exit (CancelledError unwinding the task,
             # ExecutorError, transport drop) the cached inner-SDK generation
             # may still be live and would later flush queued tool_use as
@@ -1171,10 +1216,10 @@ class ExecutorAdapter(HarnessApp):
         )
         if _is_terminal_tool_budget_result(result):
             _logger.warning(
-                "tool budget exhausted for response %s; cancelling the active generation",
+                "tool budget exhausted for response %s; requesting a final handoff",
                 ctx.response_id,
             )
-            ctx.cancelled.set()
+            self._terminal_tool_budget_ctx = ctx
         return result
 
     async def _stable_elicitation_handler(
@@ -1310,10 +1355,10 @@ class ExecutorAdapter(HarnessApp):
             and _is_terminal_tool_budget_reason(verdict.reason)
         ):
             _logger.warning(
-                "native tool budget exhausted for response %s; cancelling the active generation",
+                "native tool budget exhausted for response %s; requesting a final handoff",
                 ctx.response_id,
             )
-            ctx.cancelled.set()
+            self._terminal_tool_budget_ctx = ctx
         return verdict
 
     def _ensure_executor(self) -> Executor:
