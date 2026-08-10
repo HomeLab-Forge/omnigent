@@ -117,6 +117,23 @@ _OBSERVED_TOOL_CALL_STATUS = "in_progress"
 _MCP_TOOL_NAME_PREFIX = "mcp__"
 
 
+def _is_terminal_tool_budget_reason(value: object) -> bool:
+    if not isinstance(value, str):
+        return False
+    return ("Stopped after " in value and "failed tool calls in this turn" in value) or (
+        "Exceeded the " in value and "-tool budget for this turn" in value
+    )
+
+
+def _is_terminal_tool_budget_result(result: dict[str, Any]) -> bool:
+    error = result.get("error")
+    if isinstance(error, str):
+        return "Denied by policy" in error and _is_terminal_tool_budget_reason(error)
+    return bool(result.get("denied_by_policy")) and _is_terminal_tool_budget_reason(
+        result.get("reason")
+    )
+
+
 # Bounds on the detached, abnormal-exit executor cleanup scheduled from
 # :meth:`ExecutorAdapter.run_turn`'s finally. The interrupt and the reap
 # (``close_session`` + ``close``) get SEPARATE budgets, NOT one shared deadline:
@@ -1144,7 +1161,7 @@ class ExecutorAdapter(HarnessApp):
         traceparent = traceparents.popleft() if traceparents else None
         if traceparents is not None and not traceparents:
             self._pending_tool_traceparents.pop(trace_key, None)
-        return await _bridge_one_dispatch(
+        result = await _bridge_one_dispatch(
             ctx,
             agent,
             tool_name,
@@ -1152,6 +1169,13 @@ class ExecutorAdapter(HarnessApp):
             call_id=dispatch_call_id,
             traceparent=traceparent,
         )
+        if _is_terminal_tool_budget_result(result):
+            _logger.warning(
+                "tool budget exhausted for response %s; cancelling the active generation",
+                ctx.response_id,
+            )
+            ctx.cancelled.set()
+        return result
 
     async def _stable_elicitation_handler(
         self,
@@ -1279,7 +1303,18 @@ class ExecutorAdapter(HarnessApp):
                 ),
             )
         evaluation_id = f"poleval_{secrets.token_hex(16)}"
-        return await ctx.evaluate_policy(evaluation_id, phase, data)
+        verdict = await ctx.evaluate_policy(evaluation_id, phase, data)
+        if (
+            phase == "PHASE_TOOL_CALL"
+            and verdict.action == "POLICY_ACTION_DENY"
+            and _is_terminal_tool_budget_reason(verdict.reason)
+        ):
+            _logger.warning(
+                "native tool budget exhausted for response %s; cancelling the active generation",
+                ctx.response_id,
+            )
+            ctx.cancelled.set()
+        return verdict
 
     def _ensure_executor(self) -> Executor:
         """

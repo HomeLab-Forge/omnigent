@@ -31,6 +31,7 @@ from omnigent.inner.executor import (
     ToolSpec,
     TurnComplete,
 )
+from omnigent.runtime.harnesses import _executor_adapter as adapter_module
 from omnigent.runtime.harnesses._executor_adapter import (
     _ORPHAN_RESYNC_THRESHOLD,
     ExecutorAdapter,
@@ -173,6 +174,95 @@ async def test_orphan_tool_callback_safe_fails() -> None:
         "code": "runner_turn_context_desync",
     }
     assert adapter._orphan_callback_count == 1
+
+
+async def test_terminal_tool_budget_denial_cancels_active_turn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A bridged budget denial stops the generation instead of feeding a loop."""
+
+    async def _deny(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        del args, kwargs
+        return {
+            "error": (
+                "Denied by policy: Stopped after 2 failed tool calls in this "
+                "turn. Read the errors and report the blocker."
+            )
+        }
+
+    monkeypatch.setattr(adapter_module, "_bridge_one_dispatch", _deny)
+    adapter = ExecutorAdapter(executor_factory=_FakeExecutor)
+    ctx = _ctx("resp_budget")
+    adapter._current_ctx = ctx
+    adapter._current_agent = "watchdog"
+
+    result = await adapter._stable_tool_executor(
+        "sys_os_shell",
+        {"command": "git status"},
+    )
+
+    assert "Stopped after 2 failed tool calls" in result["error"]
+    assert ctx.cancelled.is_set()
+
+
+async def test_nonterminal_policy_denial_keeps_turn_active(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A recoverable policy denial still lets the model choose the approved path."""
+
+    async def _deny(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        del args, kwargs
+        return {
+            "error": (
+                "Denied by policy: Raw history-changing git commands are "
+                "disabled. Use gh_app_commit.py."
+            )
+        }
+
+    monkeypatch.setattr(adapter_module, "_bridge_one_dispatch", _deny)
+    adapter = ExecutorAdapter(executor_factory=_FakeExecutor)
+    ctx = _ctx("resp_guardrail")
+    adapter._current_ctx = ctx
+    adapter._current_agent = "watchdog"
+
+    await adapter._stable_tool_executor(
+        "sys_os_shell",
+        {"command": "git commit -m bad"},
+    )
+
+    assert not ctx.cancelled.is_set()
+
+
+async def test_native_tool_budget_denial_cancels_active_turn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The native-tool policy bridge applies the same terminal budget behavior."""
+    adapter = ExecutorAdapter(executor_factory=_FakeExecutor)
+    ctx = _ctx("resp_native_budget")
+    adapter._current_ctx = ctx
+
+    async def _deny(
+        evaluation_id: str,
+        phase: str,
+        data: dict[str, Any],
+    ) -> Any:
+        del evaluation_id, phase, data
+        return adapter_module.PolicyVerdictPayload(
+            action="POLICY_ACTION_DENY",
+            reason=(
+                "Exceeded the 12-tool budget for this turn. "
+                "Checkpoint progress and continue in a new turn."
+            ),
+        )
+
+    monkeypatch.setattr(ctx, "evaluate_policy", _deny)
+
+    await adapter._stable_policy_evaluator(
+        "PHASE_TOOL_CALL",
+        {"name": "read", "arguments": {}},
+    )
+
+    assert ctx.cancelled.is_set()
 
 
 async def test_watchdog_resync_is_idempotent() -> None:
