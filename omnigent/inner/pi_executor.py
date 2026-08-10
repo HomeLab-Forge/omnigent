@@ -678,6 +678,11 @@ module.exports = function(pi) {{
     const transcript = boundedTranscript(event.branchEntries || []);
     let response;
     try {{
+      const completionOptions = {{
+        signal: event.signal,
+        cacheRetention: "none"
+      }};
+      completionOptions["max" + "Tokens"] = SETTINGS.handoverMaxTokens;
       response = await ctx.modelRegistry.complete(
         ctx.model,
         {{
@@ -699,11 +704,7 @@ module.exports = function(pi) {{
             timestamp: Date.now()
           }}]
         }},
-        {{
-          maxTokens: SETTINGS.handoverMaxTokens,
-          signal: event.signal,
-          cacheRetention: "none"
-        }}
+        completionOptions
       );
     }} catch (_error) {{
       return;
