@@ -112,6 +112,10 @@ _PRINTED_TOOL_INTENT_MAX_CHARS = 4096
 # A model that prints instead of calling often keeps printing on a bare nudge,
 # so the second attempt restates the tool's argument names before we give up.
 _PRINTED_TOOL_MAX_RECOVERIES = 2
+# How much of an assistant message to hold before streaming it. A printed
+# invocation is recognisable from its opening characters, and this is small
+# enough that the pause is invisible next to the model's own decode rate.
+_PRINTED_TOOL_GATE_CHARS = 160
 
 # Each line of Pi's JSONL output; the event schema is owned by the Pi CLI
 # not us, and varies across subcommands (response ack, message_update,
@@ -2975,6 +2979,9 @@ class PiExecutor(Executor):
         handover_llm_started = False
         handover_count = 0
         printed_tool_recoveries = 0
+        text_gate_open = False
+        text_gate_buffer = ""
+        text_gate_suppressed = False
         registered_tool_names = tuple(
             name for name in (tool.get("name") for tool in tools) if isinstance(name, str)
         )
@@ -3193,6 +3200,9 @@ class PiExecutor(Executor):
                 ):
                     saw_message_end = False
                     last_assistant_requested_tool = False
+                    text_gate_open = False
+                    text_gate_buffer = ""
+                    text_gate_suppressed = False
                     call_input = list(pending_llm_input) or None
                     pending_llm_input.clear()
                     yield LLMCallStarted(
@@ -3208,7 +3218,25 @@ class PiExecutor(Executor):
                 if ame_type == "text_delta":
                     raw_delta = ame.get("delta")
                     if isinstance(raw_delta, str) and raw_delta:
-                        yield TextChunk(text=raw_delta)
+                        # Hold the opening characters back until they can be
+                        # classified. A printed tool invocation is recognisable
+                        # from its start, and streaming it would put the wrong
+                        # call format in the transcript for the next turn to
+                        # copy. Tracking is unaffected — only emission waits.
+                        if text_gate_open:
+                            yield TextChunk(text=raw_delta)
+                        else:
+                            text_gate_buffer += raw_delta
+                            if len(text_gate_buffer) >= _PRINTED_TOOL_GATE_CHARS:
+                                if (
+                                    _printed_tool_target(text_gate_buffer, registered_tool_names)
+                                    is not None
+                                ):
+                                    text_gate_suppressed = True
+                                else:
+                                    text_gate_open = True
+                                    yield TextChunk(text=text_gate_buffer)
+                                text_gate_buffer = ""
                         response_text += raw_delta
                         streamed_any = True
                         if raw_delta.strip():
@@ -3542,8 +3570,12 @@ class PiExecutor(Executor):
                             still_printed,
                             printed_tool_recoveries,
                         )
+                        # The printed text was gated out of the stream, so the
+                        # turn would otherwise end silent. Stream the handoff
+                        # instead — the adapter drops TurnComplete.response.
                         response_text = PI_PRINTED_TOOL_EXHAUSTED_RESPONSE
                         completion_text_ready = True
+                        yield TextChunk(text=PI_PRINTED_TOOL_EXHAUSTED_RESPONSE)
                 if printed_tool_target is not None:
                     printed_tool_recoveries += 1
                     logger.warning(
@@ -3621,6 +3653,15 @@ class PiExecutor(Executor):
                         pending_llm_input.append(traced_input)
                     continue
                 saw_message_end = True
+                # The message ended before the gate filled, so classify the
+                # short text now rather than releasing it unchecked.
+                if text_gate_buffer and not text_gate_suppressed:
+                    if _printed_tool_target(text_gate_buffer, registered_tool_names) is None:
+                        yield TextChunk(text=text_gate_buffer)
+                        text_gate_open = True
+                    else:
+                        text_gate_suppressed = True
+                text_gate_buffer = ""
                 last_assistant_requested_tool = _pi_message_has_tool_call(msg)
                 captured = _extract_pi_turn_usage(msg, model)
                 if captured is not None:
