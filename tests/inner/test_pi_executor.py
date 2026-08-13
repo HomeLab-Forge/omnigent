@@ -2452,7 +2452,12 @@ class TestRunTurn(unittest.TestCase):
             completed = [event for event in emitted if isinstance(event, TurnComplete)]
             self.assertEqual(len(completed), 1)
             # The printed invocation must not survive into the transcript, or the
-            # next turn copies the format instead of calling the tool.
+            # next turn copies the format instead of calling the tool. The
+            # adapter drops TurnComplete.response for streaming executors, so
+            # the streamed chunks are what actually reaches the session.
+            streamed = "".join(event.text for event in emitted if isinstance(event, TextChunk))
+            self.assertNotIn("oracle__fetch(", streamed)
+            self.assertIn("could not invoke tools", streamed)
             self.assertNotIn("oracle__fetch(", completed[0].response)
             self.assertIn("could not invoke tools", completed[0].response)
 
