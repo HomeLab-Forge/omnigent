@@ -67,7 +67,9 @@ from omnigent.pi_native_credentials import (
 from omnigent.runner.identity import OMNIGENT_SESSION_ENV_VAR
 from omnigent.runtime.prompt import (
     PI_AGENT_COMPLETION_INSTRUCTION,
+    PI_PRINTED_TOOL_EXHAUSTED_RESPONSE,
     PI_PRINTED_TOOL_RECOVERY,
+    PI_PRINTED_TOOL_RECOVERY_WITH_SCHEMA,
     PI_TOOL_TURN_CONTINUATION,
     append_framework_instructions,
 )
@@ -107,6 +109,9 @@ _TOOL_TURN_MAX_CONTINUATIONS = 2
 _TOOL_EXECUTION_MAX_SECONDS = 600.0
 _POST_TOOL_EVENT_IDLE_TIMEOUT_SECONDS = 70.0
 _PRINTED_TOOL_INTENT_MAX_CHARS = 4096
+# A model that prints instead of calling often keeps printing on a bare nudge,
+# so the second attempt restates the tool's argument names before we give up.
+_PRINTED_TOOL_MAX_RECOVERIES = 2
 
 # Each line of Pi's JSONL output; the event schema is owned by the Pi CLI
 # not us, and varies across subcommands (response ack, message_update,
@@ -1885,6 +1890,42 @@ def _printed_tool_target(text: str, tool_names: Sequence[str]) -> str | None:
     return target if target in registered else None
 
 
+def _printed_tool_arguments(tool_name: str, tool_schemas: Sequence[ToolSpec]) -> str:
+    """Return a readable argument list for a registered tool, or ``""``."""
+    for schema in tool_schemas:
+        if not isinstance(schema, dict) or schema.get("name") != tool_name:
+            continue
+        parameters = schema.get("parameters")
+        if not isinstance(parameters, dict):
+            return ""
+        properties = parameters.get("properties")
+        if not isinstance(properties, dict) or not properties:
+            return ""
+        required = parameters.get("required")
+        required_names = set(required) if isinstance(required, list) else set()
+        rendered = [
+            f"{name} (required)" if name in required_names else name for name in properties
+        ]
+        return ", ".join(rendered)
+    return ""
+
+
+def _printed_tool_recovery_prompt(
+    tool_name: str,
+    tool_schemas: Sequence[ToolSpec],
+    attempt: int,
+) -> str:
+    """Build the recovery prompt for a printed tool invocation."""
+    if attempt < 2:
+        return PI_PRINTED_TOOL_RECOVERY.format(tool_name=tool_name)
+    arguments = _printed_tool_arguments(tool_name, tool_schemas)
+    if not arguments:
+        return PI_PRINTED_TOOL_RECOVERY.format(tool_name=tool_name)
+    return PI_PRINTED_TOOL_RECOVERY_WITH_SCHEMA.format(
+        tool_name=tool_name, tool_arguments=arguments
+    )
+
+
 def _aggregate_pi_turn_usage(
     message_usages: list[_PiMessageUsage],
     fallback_model: str | None,
@@ -3485,13 +3526,34 @@ class PiExecutor(Executor):
                 printed_tool_text = end_response_text or response_text
                 printed_tool_target = (
                     _printed_tool_target(printed_tool_text, registered_tool_names)
-                    if not last_assistant_requested_tool and printed_tool_recoveries == 0
+                    if not last_assistant_requested_tool
+                    and printed_tool_recoveries < _PRINTED_TOOL_MAX_RECOVERIES
                     else None
                 )
+                if printed_tool_target is None and printed_tool_recoveries > 0:
+                    # Every retry still printed. Drop the printed text so it
+                    # never lands in the transcript, where the next turn would
+                    # copy the format it sees.
+                    still_printed = _printed_tool_target(printed_tool_text, registered_tool_names)
+                    if still_printed is not None:
+                        logger.warning(
+                            "pi printed tool invocation for %s after %d recoveries; "
+                            "discarding printed text",
+                            still_printed,
+                            printed_tool_recoveries,
+                        )
+                        response_text = PI_PRINTED_TOOL_EXHAUSTED_RESPONSE
+                        completion_text_ready = True
                 if printed_tool_target is not None:
                     printed_tool_recoveries += 1
-                    recovery_prompt = PI_PRINTED_TOOL_RECOVERY.format(
-                        tool_name=printed_tool_target
+                    logger.warning(
+                        "pi printed tool invocation instead of calling %s; recovery %d/%d",
+                        printed_tool_target,
+                        printed_tool_recoveries,
+                        _PRINTED_TOOL_MAX_RECOVERIES,
+                    )
+                    recovery_prompt = _printed_tool_recovery_prompt(
+                        printed_tool_target, tools, printed_tool_recoveries
                     )
                     pending_llm_input = [{"role": "user", "content": recovery_prompt}]
                     response_text = ""

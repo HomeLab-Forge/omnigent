@@ -42,6 +42,8 @@ from omnigent.inner.pi_executor import (
     _handover_from_compaction,
     _pi_provider_for_model,
     _PiRpcSession,
+    _printed_tool_arguments,
+    _printed_tool_recovery_prompt,
     _printed_tool_target,
     _redact_argv_for_log,
     _safe_dumps,
@@ -2038,6 +2040,44 @@ def test_printed_tool_target_recognizes_exact_and_legacy_invocations() -> None:
     assert _printed_tool_target("Use sys_os_read when you need the file.", tool_names) is None
 
 
+def test_printed_tool_arguments_lists_properties_and_marks_required() -> None:
+    tools = [
+        {
+            "name": "oracle__fetch",
+            "parameters": {
+                "type": "object",
+                "properties": {"ref": {"type": "string"}, "source": {"type": "string"}},
+                "required": ["ref"],
+            },
+        }
+    ]
+
+    assert _printed_tool_arguments("oracle__fetch", tools) == "ref (required), source"
+    assert _printed_tool_arguments("sys_os_read", tools) == ""
+
+
+def test_printed_tool_recovery_prompt_adds_schema_on_second_attempt() -> None:
+    tools = [
+        {
+            "name": "oracle__fetch",
+            "parameters": {
+                "type": "object",
+                "properties": {"ref": {"type": "string"}},
+                "required": ["ref"],
+            },
+        }
+    ]
+
+    first = _printed_tool_recovery_prompt("oracle__fetch", tools, 1)
+    second = _printed_tool_recovery_prompt("oracle__fetch", tools, 2)
+
+    assert "accepted arguments" not in first
+    assert "ref (required)" in second
+
+    # No schema to quote, so the retry falls back to the plain nudge.
+    assert "accepted arguments" not in _printed_tool_recovery_prompt("missing", tools, 2)
+
+
 class TestRunTurn(unittest.TestCase):
     def _make_executor(self):
         with patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"):
@@ -2323,6 +2363,107 @@ class TestRunTurn(unittest.TestCase):
             self.assertEqual(len(recovery), 1)
             self.assertIn("Invoke the registered tool `sys_os_read` now", recovery[0]["message"])
             self.assertEqual(recovery[0]["streamingBehavior"], "followUp")
+
+        _run(_test())
+
+    def test_printed_tool_intent_retries_then_drops_the_printed_text(self):
+        async def _test():
+            executor = self._make_executor()
+            fake_rpc = _PiRpcSession()
+            fake_rpc._line_queue = asyncio.Queue()
+            fake_rpc.process = MagicMock()
+            fake_rpc.process.returncode = None
+            writer = _FakeStreamWriter()
+            fake_rpc.process.stdin = writer
+            fake_rpc._stderr_lines = []
+
+            printed = 'oracle__fetch(query="repo://HomeLab-Forge/ops/compose.yaml")'
+            assistant_usage = {
+                "input": 100,
+                "output": 20,
+                "cacheRead": 0,
+                "cacheWrite": 0,
+                "totalTokens": 120,
+            }
+
+            def printed_round():
+                return [
+                    {
+                        "type": "message_start",
+                        "message": {"role": "assistant", "model": "test-model"},
+                    },
+                    {
+                        "type": "message_update",
+                        "assistantMessageEvent": {"type": "text_delta", "delta": printed},
+                    },
+                    {
+                        "type": "message_end",
+                        "message": {
+                            "role": "assistant",
+                            "model": "test-model",
+                            "stopReason": "stop",
+                            "content": [{"type": "text", "text": printed}],
+                            "usage": assistant_usage,
+                        },
+                    },
+                    {
+                        "type": "agent_end",
+                        "messages": [
+                            {"role": "assistant", "content": [{"type": "text", "text": printed}]}
+                        ],
+                    },
+                ]
+
+            # Every attempt prints instead of calling: the first turn plus one
+            # response ack per recovery prompt.
+            events = [{"type": "response", "success": True}]
+            events.extend(printed_round())
+            for _ in range(2):
+                events.append({"type": "response", "success": True})
+                events.extend(printed_round())
+            for event in events:
+                fake_rpc._line_queue.put_nowait(json.dumps(event))
+
+            async def fake_ensure_rpc(*args, **kwargs):
+                return fake_rpc
+
+            executor._ensure_rpc = fake_ensure_rpc
+            tools = [
+                {
+                    "name": "oracle__fetch",
+                    "description": "Fetch a ref.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"ref": {"type": "string"}},
+                        "required": ["ref"],
+                    },
+                }
+            ]
+
+            emitted = [
+                event
+                async for event in executor.run_turn(
+                    [{"role": "user", "content": "Fetch the compose file"}],
+                    tools,
+                    "system",
+                )
+            ]
+
+            completed = [event for event in emitted if isinstance(event, TurnComplete)]
+            self.assertEqual(len(completed), 1)
+            # The printed invocation must not survive into the transcript, or the
+            # next turn copies the format instead of calling the tool.
+            self.assertNotIn("oracle__fetch(", completed[0].response)
+            self.assertIn("could not invoke tools", completed[0].response)
+
+            commands = [json.loads(frame) for frame in writer.data]
+            recovery = [
+                command
+                for command in commands
+                if command.get("id", "").endswith("_printed_tool_recovery")
+            ]
+            self.assertEqual(len(recovery), 2)
+            self.assertIn("ref (required)", recovery[1]["message"])
 
         _run(_test())
 
@@ -5764,9 +5905,7 @@ def test_a_completed_turn_does_not_interrupt_the_session() -> None:
 
         events = [
             event
-            async for event in executor.run_turn(
-                [{"role": "user", "content": "hi"}], [], "system"
-            )
+            async for event in executor.run_turn([{"role": "user", "content": "hi"}], [], "system")
         ]
 
         assert any(isinstance(event, TurnComplete) for event in events)
