@@ -61,6 +61,27 @@ PI_PRINTED_TOOL_RECOVERY = (
     "Use the supplied tool schema and continue the task from its result."
 )
 
+# A model that printed once usually printed because it guessed the argument
+# names. The retry restates the accepted arguments so the second attempt has
+# the schema in front of it rather than in the tool list far above.
+PI_PRINTED_TOOL_RECOVERY_WITH_SCHEMA = (
+    "Your previous response printed a tool invocation instead of making a protocol call. "
+    "Invoke the registered tool `{tool_name}` now. Do not describe, quote, or fence the call. "
+    "Its accepted arguments are: {tool_arguments}. "
+    "Emit a protocol tool call with those argument names and continue from its result."
+)
+
+# Sent when every recovery attempt still came back as printed text. The turn
+# ends without work, so the response says that plainly instead of leaving the
+# printed invocation to look like a result.
+PI_PRINTED_TOOL_EXHAUSTED_RESPONSE = (
+    "Done: nothing — I could not invoke tools on this turn.\n"
+    "Intended next: call the registered tool as a protocol call and continue the task.\n"
+    "Stopped because: my replies printed the tool invocation as text instead of "
+    "calling it, through every retry.\n"
+    "Need from you: resend the request to start a clean turn."
+)
+
 
 def shared_message_attribution_enabled() -> bool:
     """Return whether shared-message authors are visible to the model.
