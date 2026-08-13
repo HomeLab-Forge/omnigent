@@ -1504,6 +1504,16 @@ class AgentSpec:  # type: ignore[explicit-any]  # params: dict[str, Any] field (
         ``non-public`` (grant named users only), or ``public`` (also
         allow ``__public__`` anonymous read). **Defaults to
         ``SharePolicy.NONE``.**
+    :param framework_tools: Which auto-registered framework tool GROUPS
+        this agent advertises. YAML key is ``framework_tools:``
+        (top-level, like ``skills:``), and the shapes match: ``"all"``
+        (default), ``"none"``, or a list of group names from
+        :data:`omnigent.spec.parser.FRAMEWORK_TOOL_GROUPS`. Every group
+        registers unconditionally otherwise, which is right for a desktop
+        agent and wrong for a headless one — a server-driven agent gets
+        five ``browser_*`` tools it cannot reach and two review-comment
+        tools that can only return empty. **Defaults to ``"all"``, so an
+        existing spec keeps today's surface.**
     """
 
     spec_version: int
@@ -1550,3 +1560,4 @@ class AgentSpec:  # type: ignore[explicit-any]  # params: dict[str, Any] field (
     timers: bool = False
     spawn: bool = False
     agent_session_sharing: SharePolicy = SharePolicy.NONE
+    framework_tools: str | list[str] = "all"
