@@ -17,6 +17,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from omnigent.inner import pi_executor
 from omnigent.inner.databricks_executor import DatabricksCredentials
 from omnigent.inner.executor import (
     CompactionComplete,
@@ -5917,3 +5918,93 @@ def test_a_completed_turn_does_not_interrupt_the_session() -> None:
         assert not interrupted
 
     _run(_test())
+
+
+# ── fallback handover: do not restart a half-finished task ────
+
+
+def test_a_completed_call_is_recorded_with_its_subject() -> None:
+    calls: dict[str, None] = {}
+    skills: dict[str, None] = {}
+
+    pi_executor._record_completed_call(
+        calls, skills, "sys_os_read", {"path": "/workspace/HomeLab-Forge/ops/compose.yaml"}
+    )
+
+    assert list(calls) == ["sys_os_read(/workspace/HomeLab-Forge/ops/compose.yaml)"]
+
+
+def test_a_repeated_call_is_recorded_once() -> None:
+    calls: dict[str, None] = {}
+    skills: dict[str, None] = {}
+
+    for _ in range(3):
+        pi_executor._record_completed_call(calls, skills, "sys_os_read", {"path": "/a.yaml"})
+
+    assert list(calls) == ["sys_os_read(/a.yaml)"]
+
+
+def test_load_skill_is_recorded_as_a_skill_not_a_call() -> None:
+    calls: dict[str, None] = {}
+    skills: dict[str, None] = {}
+
+    pi_executor._record_completed_call(calls, skills, "load_skill", {"name": "research"})
+
+    assert list(skills) == ["research"]
+    assert list(calls) == []
+
+
+def test_a_long_subject_is_capped() -> None:
+    calls: dict[str, None] = {}
+    skills: dict[str, None] = {}
+
+    pi_executor._record_completed_call(calls, skills, "sys_os_shell", {"command": "x" * 500})
+
+    (only,) = list(calls)
+    assert len(only) < 200
+
+
+def _fallback(**kwargs: object) -> object:
+    return pi_executor._handover_from_compaction(
+        result={"summary": "a progress note"},
+        original_directive="Add Vaultwarden to the productivity stack. Open one PR per repo.",
+        repository_state=None,
+        context_tokens=40000,
+        **kwargs,  # type: ignore[arg-type]
+    )
+
+
+def test_the_fallback_carries_the_directive_verbatim() -> None:
+    handover = _fallback()
+
+    assert handover.mode == "generic"
+    assert "Open one PR per repo" in handover.original_directive
+
+
+def test_the_fallback_does_not_invent_a_phase() -> None:
+    handover = _fallback(last_phase="edit")
+
+    assert handover.phase == "edit", (
+        "asserting investigate here is what sent a half-finished task back to discovery"
+    )
+
+
+def test_the_fallback_still_defaults_when_no_phase_is_known() -> None:
+    assert _fallback().phase == "investigate"
+
+
+def test_the_fallback_populates_do_not_repeat() -> None:
+    handover = _fallback(
+        completed_calls=("sys_os_read(/a.yaml)", "sys_os_read(/b.yaml)"),
+        loaded_skills=("contribute", "research"),
+    )
+
+    assert handover.do_not_repeat == ["sys_os_read(/a.yaml)", "sys_os_read(/b.yaml)"]
+    assert handover.loaded_skills == ["contribute", "research"]
+
+
+def test_the_fallback_points_at_the_directive_not_the_summary() -> None:
+    handover = _fallback()
+
+    assert "directive" in handover.next_action.lower()
+    assert "do_not_repeat" in handover.next_action

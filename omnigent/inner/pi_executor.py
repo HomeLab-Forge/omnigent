@@ -74,6 +74,7 @@ from omnigent.runtime.prompt import (
     append_framework_instructions,
 )
 from omnigent.runtime.session_checkpoint import (
+    CheckpointPhase,
     RepositoryState,
     SemanticHandoverDraft,
     SessionHandover,
@@ -2120,12 +2121,58 @@ def _build_handover_request(
     )
 
 
+#: Argument keys that identify WHAT a call acted on, in preference order. A
+#: bare tool name is useless in ``do_not_repeat`` — "you already ran
+#: sys_os_read" tells the model nothing, "you already read <path>" tells it
+#: everything.
+_CALL_SUBJECT_KEYS = ("path", "command", "query", "question", "ref", "name")
+
+
+def _record_completed_call(
+    completed_calls: dict[str, None],
+    loaded_skills: dict[str, None],
+    tool_name: str,
+    args: object,
+) -> None:
+    """Note one dispatched call so a fallback handover can report it.
+
+    Insertion-ordered dicts used as ordered sets: a call repeated within the
+    turn is recorded once. Only the argument that identifies the subject is
+    kept, capped, so nothing large or secret-bearing rides along — the
+    handover model redacts and caps again on the way in.
+
+    :param completed_calls: Ordered set of rendered ``tool(subject)`` strings,
+        mutated in place.
+    :param loaded_skills: Ordered set of skill names, mutated in place.
+    :param tool_name: The Pi ``toolName`` for this call.
+    :param args: The call's arguments, normally a mapping.
+    """
+    if not isinstance(tool_name, str) or not tool_name:
+        return
+    mapping = args if isinstance(args, Mapping) else {}
+    if tool_name == "load_skill":
+        skill = mapping.get("name")
+        if isinstance(skill, str) and skill:
+            loaded_skills[skill[:128]] = None
+            return
+    subject = ""
+    for key in _CALL_SUBJECT_KEYS:
+        value = mapping.get(key)
+        if isinstance(value, str) and value.strip():
+            subject = " ".join(value.split())[:160]
+            break
+    completed_calls[f"{tool_name}({subject})" if subject else tool_name] = None
+
+
 def _handover_from_compaction(
     *,
     result: Mapping[str, Any],
     original_directive: str,
     repository_state: RepositoryState | None,
     context_tokens: int,
+    completed_calls: Sequence[str] = (),
+    loaded_skills: Sequence[str] = (),
+    last_phase: CheckpointPhase | None = None,
 ) -> SessionHandover:
     summary = str(result.get("summary") or "")
     details = result.get("details")
@@ -2147,13 +2194,42 @@ def _handover_from_compaction(
             )
 
     fallback_text = summary or "The structured handover was unavailable."
+    # The model did not produce the structured object, so everything below is
+    # what the framework knows on its own. This branch used to assert
+    # phase="investigate" unconditionally, which told a half-finished task it
+    # was still in discovery: session 3cbedace came back from a rollover and
+    # re-read six files it had already read, loaded one skill three times, and
+    # died on the loop guard with 49 tool calls and no writes. A fallback may
+    # not know the phase; it must not invent one.
+    logger.warning(
+        "structured handover unavailable; falling back to a generic handover "
+        "(phase=%s, completed_calls=%d, loaded_skills=%d)",
+        last_phase or "unknown",
+        len(completed_calls),
+        len(loaded_skills),
+    )
     return SessionHandover(
         mode="generic",
         original_directive=original_directive,
-        objective="Continue the original task from the fallback compaction summary.",
-        phase="investigate",
-        remaining_work=["Reconcile the fallback summary with current repository state."],
-        next_action="Read the fallback summary, then take the first unfinished action.",
+        objective=(
+            "Continue the original directive above. The structured handover was "
+            "unavailable, so treat the directive as the specification and the "
+            "summary below only as a progress note."
+        ),
+        # Carry the phase forward when the turn reached one. "investigate" is
+        # the default only when nothing better is known.
+        phase=last_phase or "investigate",
+        remaining_work=[
+            "Re-read the original directive and resume at its first unmet requirement."
+        ],
+        next_action=(
+            "Take the first action the original directive requires that is not "
+            "already listed in do_not_repeat."
+        ),
+        # The continuation prompt tells the model not to repeat these, and this
+        # branch used to hand it an empty list.
+        do_not_repeat=list(completed_calls),
+        loaded_skills=list(loaded_skills),
         repository_state=repository_state,
         context_tokens=context_tokens,
         fallback_summary=fallback_text,
@@ -2982,6 +3058,13 @@ class PiExecutor(Executor):
         text_gate_open = False
         text_gate_buffer = ""
         text_gate_suppressed = False
+        # What this turn has already done, kept so a fallback handover can say
+        # so. The model is asked for the same thing and does not always answer;
+        # this is the part the framework can know without being told. Ordered
+        # and deduplicated, because the value is "you already read this", not
+        # "you read this six times".
+        completed_calls: dict[str, None] = {}
+        loaded_skills: dict[str, None] = {}
         registered_tool_names = tuple(
             name for name in (tool.get("name") for tool in tools) if isinstance(name, str)
         )
@@ -3145,6 +3228,8 @@ class PiExecutor(Executor):
                             original_directive=original_directive,
                             repository_state=handover_repository_state,
                             context_tokens=handover_due_context_tokens,
+                            completed_calls=tuple(completed_calls),
+                            loaded_skills=tuple(loaded_skills),
                         )
                         continuation = _handover_continuation(handover)
                         handover_count += 1
@@ -3260,6 +3345,7 @@ class PiExecutor(Executor):
                 active_tool_calls += 1
                 tool_name = event.get("toolName", "unknown")
                 args = event.get("args", {})
+                _record_completed_call(completed_calls, loaded_skills, tool_name, args)
                 yield ToolCallRequest(
                     name=tool_name,
                     args=args if isinstance(args, dict) else {},
@@ -3432,6 +3518,8 @@ class PiExecutor(Executor):
                         original_directive=original_directive,
                         repository_state=handover_repository_state,
                         context_tokens=handover_due_context_tokens,
+                        completed_calls=tuple(completed_calls),
+                        loaded_skills=tuple(loaded_skills),
                     )
                 except (TypeError, ValueError):
                     handover = _handover_from_compaction(
@@ -3439,6 +3527,8 @@ class PiExecutor(Executor):
                         original_directive=original_directive,
                         repository_state=handover_repository_state,
                         context_tokens=handover_due_context_tokens,
+                        completed_calls=tuple(completed_calls),
+                        loaded_skills=tuple(loaded_skills),
                     )
                 continuation = _handover_continuation(handover)
                 handover_count += 1
