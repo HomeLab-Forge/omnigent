@@ -6010,6 +6010,28 @@ def test_the_fallback_points_at_the_directive_not_the_summary() -> None:
     assert "do_not_repeat" in handover.next_action
 
 
+def test_the_phase_is_derived_from_what_the_turn_actually_ran() -> None:
+    assert pi_executor._infer_phase([]) == "investigate"
+    assert pi_executor._infer_phase(["sys_os_read(/a.yaml)"]) == "investigate"
+    assert pi_executor._infer_phase(["sys_os_read(/a)", "sys_os_write(/b)"]) == "edit"
+    assert (
+        pi_executor._infer_phase(["sys_os_write(/b)", "sys_os_shell(python gh_app_commit.py ...)"])
+        == "commit"
+    )
+    assert (
+        pi_executor._infer_phase(["sys_os_write(/b)", "github__call_tool(create_pull_request)"])
+        == "open_pr"
+    )
+
+
+def test_a_fallback_after_an_edit_does_not_claim_investigate() -> None:
+    handover = _fallback(completed_calls=("sys_os_read(/a)", "sys_os_edit(/b)"))
+
+    assert handover.phase == "edit", (
+        "reporting investigate here is what sent a half-finished task back to discovery"
+    )
+
+
 # ── Pi's own auto-compaction must not race Omnigent's rollover ───
 
 

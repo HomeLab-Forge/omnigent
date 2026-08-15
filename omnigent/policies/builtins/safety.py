@@ -219,6 +219,115 @@ def tool_budget_per_turn(
 
 
 _LOOP_STATE_KEY = "_policy_loop_recent_hashes"
+_PROGRESS_STATE_KEY = "_policy_calls_since_progress"
+
+
+def require_progress(
+    budget: int = 25,
+    progress_tools: list[str] | None = None,
+    action: Literal["ASK", "DENY"] = "DENY",
+    exempt_tools: list[str] | None = None,
+    reset_on_request: bool = True,
+) -> PolicyCallable:
+    """Factory: stop an agent that gathers evidence and never acts.
+
+    Counts tool calls since the last one that CHANGED something, and
+    denies further calls once the budget is spent. A call naming any
+    tool in *progress_tools* resets the counter to zero.
+
+    This is a different failure from :func:`detect_loop`, which needs
+    identical arguments to fire. An agent reading a hundred different
+    files makes no repeated call and no progress either: observed at 79
+    calls across 31 reads, 21 shell commands and 17 searches with zero
+    writes, having announced four separate times that it now understood
+    the code and would begin. Nothing in the stack could see that, because
+    every individual call was reasonable and none of them repeated.
+
+    The denial is not a stop. Its reason names the budget, the fact that
+    nothing has changed yet, and the tools that count as progress, so the
+    next decision is to make the smallest real change rather than to
+    gather more. Deny is preferred over ask for exactly that: an ask can
+    be answered with more reading.
+
+    :param budget: Calls allowed since the last progress call before the
+        action fires. Defaults to ``25``. Clamped to a minimum of ``1``.
+    :param progress_tools: Tool names that count as progress and reset
+        the counter, e.g. ``["sys_os_write", "sys_os_edit"]``. A call to
+        one of these is always allowed. Empty means nothing ever resets,
+        which is a misconfiguration, so an empty list disables the policy.
+    :param action: ``"ASK"`` or ``"DENY"`` once the budget is spent.
+    :param exempt_tools: Tool names that neither count against the budget
+        nor reset it, such as a bounded poll.
+    :param reset_on_request: Clear the counter on each user turn, so a
+        fresh instruction starts with a full budget.
+    :returns: A policy callable that forces a phase transition.
+    """
+    budget = max(1, budget)
+    normalized_action = action.upper() if action.upper() in {"ASK", "DENY"} else "DENY"
+    progress = frozenset(progress_tools or [])
+    exempt = frozenset(exempt_tools or [])
+
+    def evaluate(event: PolicyEvent) -> PolicyResponse:
+        """Evaluate whether this call is allowed given the progress budget.
+
+        :param event: Policy event dict.
+        :returns: The configured action once the budget is spent, else ALLOW.
+        """
+        event_type = event.get("type")
+        if event_type == "request" and reset_on_request:
+            return {
+                "result": "ALLOW",
+                "state_updates": [
+                    {"key": _PROGRESS_STATE_KEY, "action": "set", "value": 0},
+                ],
+            }
+        if event_type != "tool_call" or not progress:
+            return _ALLOW
+        data = event.get("data")
+        if not isinstance(data, dict):
+            return _ALLOW
+
+        tool_name = data.get("name", "")
+        if tool_name in exempt:
+            return _ALLOW
+        if tool_name in progress:
+            return {
+                "result": "ALLOW",
+                "state_updates": [
+                    {"key": _PROGRESS_STATE_KEY, "action": "set", "value": 0},
+                ],
+            }
+
+        state = event.get("session_state") or {}
+        raw = state.get(_PROGRESS_STATE_KEY)
+        spent = raw + 1 if isinstance(raw, int) and raw >= 0 else 1
+
+        if spent > budget:
+            return {
+                "result": normalized_action,
+                "reason": (
+                    f"Progress guard: {spent - 1} tool calls since anything last "
+                    f"changed, against a budget of {budget}, and nothing has been "
+                    "written yet. You have enough to start. Make the smallest "
+                    "change that moves the task forward using one of: "
+                    f"{', '.join(sorted(progress))}. An incomplete first change "
+                    "that can be reviewed is worth more than more evidence. If "
+                    "the task genuinely cannot be started, say what is missing "
+                    "in an incomplete-stop handoff instead of reading further."
+                ),
+                "state_updates": [
+                    {"key": _PROGRESS_STATE_KEY, "action": "set", "value": spent},
+                ],
+            }
+
+        return {
+            "result": "ALLOW",
+            "state_updates": [
+                {"key": _PROGRESS_STATE_KEY, "action": "set", "value": spent},
+            ],
+        }
+
+    return evaluate
 
 
 def _args_hash(tool_name: str, arguments: object) -> str:
@@ -857,6 +966,48 @@ POLICY_REGISTRY: list[dict[str, object]] = [
                 "reset_on_request": {
                     "type": "boolean",
                     "description": "Clear recent-call history for each user turn",
+                    "default": True,
+                },
+            },
+        },
+    },
+    {
+        "handler": "omnigent.policies.builtins.safety.require_progress",
+        "kind": "factory",
+        "name": "Require Progress Before More Evidence",
+        "description": "Denies further tool calls once the agent has spent its budget "
+        "gathering evidence without changing anything. Distinct from the retry-loop "
+        "guard: a hundred different reads repeat no call and still make no progress",
+        "params_schema": {
+            "type": "object",
+            "properties": {
+                "budget": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "Tool calls allowed since anything last changed",
+                    "default": 25,
+                },
+                "progress_tools": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Tool names that count as progress and reset the budget",
+                    "default": [],
+                },
+                "action": {
+                    "type": "string",
+                    "enum": ["ASK", "DENY"],
+                    "description": "Response once the budget is spent",
+                    "default": "DENY",
+                },
+                "exempt_tools": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Tool names that neither spend nor reset the budget",
+                    "default": [],
+                },
+                "reset_on_request": {
+                    "type": "boolean",
+                    "description": "Restore a full budget for each user turn",
                     "default": True,
                 },
             },

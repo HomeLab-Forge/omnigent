@@ -677,6 +677,12 @@ const SETTINGS = {settings_json};
 const REQUEST_PREFIX = "OMNIGENT_STRUCTURED_HANDOVER_V1\\n";
 const FIRST_KEPT_SENTINEL = "__omnigent_handover_v1__";
 
+// Every failure path here used to `return` silently, so a fallback handover was
+// indistinguishable from one that never ran. stderr is the runner log.
+function bail(why) {{
+  try {{ console.error("[omnigent-handover] giving up: " + why); }} catch (_e) {{}}
+}}
+
 function renderEntry(entry) {{
   if (!entry || typeof entry !== "object") return "";
   if (entry.type === "message" && entry.message) {{
@@ -717,12 +723,13 @@ module.exports = function(pi) {{
   pi.on("session_before_compact", async (event, ctx) => {{
     const instructions = event && event.customInstructions;
     if (typeof instructions !== "string" || !instructions.startsWith(REQUEST_PREFIX)) return;
-    if (!ctx.model) return;
+    if (!ctx.model) {{ bail("no model on the compaction context"); return; }}
 
     let request;
     try {{
       request = JSON.parse(instructions.slice(REQUEST_PREFIX.length));
-    }} catch (_error) {{
+    }} catch (error) {{
+      bail("request payload did not parse: " + error);
       return;
     }}
 
@@ -749,7 +756,7 @@ module.exports = function(pi) {{
             role: "user",
             content: [{{
               type: "text",
-              text: JSON.stringify(request) + "\\n\\n<conversation>\\n"
+              text: REQUEST_PREFIX + JSON.stringify(request) + "\\n\\n<conversation>\\n"
                 + transcript + "\\n</conversation>"
             }}],
             timestamp: Date.now()
@@ -757,7 +764,8 @@ module.exports = function(pi) {{
         }},
         completionOptions
       );
-    }} catch (_error) {{
+    }} catch (error) {{
+      bail("handover completion failed: " + error);
       return;
     }}
 
@@ -769,10 +777,14 @@ module.exports = function(pi) {{
     let draft;
     try {{
       draft = extractJson(text);
-    }} catch (_error) {{
+    }} catch (error) {{
+      bail("model did not return JSON (" + text.length + " chars): " + error);
       return;
     }}
-    if (!draft || typeof draft !== "object") return;
+    if (!draft || typeof draft !== "object") {{
+      bail("parsed handover was not an object");
+      return;
+    }}
     draft.original_directive = request.original_directive;
 
     const summary = "Structured session handover:\\n" + JSON.stringify(draft, null, 2);
@@ -2201,6 +2213,36 @@ def _record_completed_call(
     completed_calls[f"{tool_name}({subject})" if subject else tool_name] = None
 
 
+#: Phase markers, most-advanced first. Each entry is (phase, substrings): a
+#: completed call containing any of the substrings proves the turn reached that
+#: phase. Matched against the rendered ``tool(subject)`` strings, so a shell
+#: command's own text counts — that is where commits and pushes live, since raw
+#: git commit/push is denied and the contribution helper is invoked by name.
+_PHASE_MARKERS: tuple[tuple[CheckpointPhase, tuple[str, ...]], ...] = (
+    ("open_pr", ("create_pull_request", "update_pull_request")),
+    ("commit", ("gh_app_commit", "git push", "prepare_existing_branch")),
+    ("edit", ("sys_os_write", "sys_os_edit")),
+)
+
+
+def _infer_phase(completed_calls: Sequence[str]) -> CheckpointPhase:
+    """Derive how far the turn actually got from what it actually ran.
+
+    A fallback handover cannot ask the model what phase it was in — that is the
+    answer that just failed to arrive. But the framework watched every call, so
+    it can say what the turn demonstrably did. Evidence, not assertion.
+
+    :param completed_calls: Rendered ``tool(subject)`` strings for this turn.
+    :returns: The most advanced phase with evidence behind it, else
+        ``"investigate"`` — which is then a floor, not a claim.
+    """
+    haystack = "\n".join(completed_calls)
+    for phase, markers in _PHASE_MARKERS:
+        if any(marker in haystack for marker in markers):
+            return phase
+    return "investigate"
+
+
 def _handover_from_compaction(
     *,
     result: Mapping[str, Any],
@@ -2238,10 +2280,14 @@ def _handover_from_compaction(
     # re-read six files it had already read, loaded one skill three times, and
     # died on the loop guard with 49 tool calls and no writes. A fallback may
     # not know the phase; it must not invent one.
+    # Derived, not asserted: last_phase is an override for a caller that knows
+    # better, and nothing does today. Before this, the fallback logged
+    # "phase=unknown" and defaulted to investigate on every rollover.
+    phase = last_phase or _infer_phase(completed_calls)
     logger.warning(
         "structured handover unavailable; falling back to a generic handover "
         "(phase=%s, completed_calls=%d, loaded_skills=%d)",
-        last_phase or "unknown",
+        phase,
         len(completed_calls),
         len(loaded_skills),
     )
@@ -2254,8 +2300,8 @@ def _handover_from_compaction(
             "summary below only as a progress note."
         ),
         # Carry the phase forward when the turn reached one. "investigate" is
-        # the default only when nothing better is known.
-        phase=last_phase or "investigate",
+        # the floor, reached only when no call proved anything further.
+        phase=phase,
         remaining_work=[
             "Re-read the original directive and resume at its first unmet requirement."
         ],
