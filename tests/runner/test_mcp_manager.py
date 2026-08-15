@@ -868,3 +868,34 @@ def test_strip_mcp_tool_prefix_preserves_bare_double_underscore() -> None:
     assert _strip_mcp_tool_prefix("bare_name") == "bare_name"
     # Looks-like-prefix but only two parts: preserved.
     assert _strip_mcp_tool_prefix("mcp__missing_third") == "mcp__missing_third"
+
+
+# ── Per-call request metadata ───────────────────────────────────────────────
+#
+# An MCP server sees one long-lived connection per runner, and its connection
+# headers come from static spec config. Anything that varies per call — the
+# trace context, and now the session and agent — has to travel in _meta.
+
+
+def test_request_meta_carries_trace_session_and_agent() -> None:
+    meta = RunnerMcpManager._request_meta("00-abc-def-01", "conv_abc123", "watchdog")
+    assert meta == {
+        "traceparent": "00-abc-def-01",
+        "omnigent-session-id": "conv_abc123",
+        "omnigent-agent": "watchdog",
+    }
+
+
+def test_request_meta_omits_what_is_not_known() -> None:
+    assert RunnerMcpManager._request_meta(None, "conv_abc123", None) == {
+        "omnigent-session-id": "conv_abc123"
+    }
+
+
+def test_request_meta_is_none_when_nothing_is_known() -> None:
+    """MCP omits _meta entirely rather than sending an empty object."""
+    assert RunnerMcpManager._request_meta(None, None, None) is None
+
+
+def test_request_meta_drops_empty_strings() -> None:
+    assert RunnerMcpManager._request_meta("", "", "watchdog") == {"omnigent-agent": "watchdog"}

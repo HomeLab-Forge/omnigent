@@ -392,6 +392,40 @@ class RunnerMcpManager:
                 for ref in refs:
                     self._release_server_ref(ref.entry, entry.spec_hash)
 
+    @staticmethod
+    def _request_meta(
+        traceparent: str | None,
+        session_id: str | None,
+        agent: str | None,
+    ) -> dict[str, str] | None:
+        """Build the ``params._meta`` payload for one MCP tool call.
+
+        An MCP server sees one long-lived connection per runner and a
+        stream of calls over it. Connection headers come from static spec
+        config, so per-call identity has to travel here — the same channel
+        the trace context already uses.
+
+        Session and agent are what let a server keep per-session state
+        without inventing its own correlation. The homelab Oracle files
+        large fetches under ``<agent>-<session>/`` on that basis, so a
+        server that never reads these keys is unaffected and one that does
+        gets the same identity the trace carries.
+
+        :param traceparent: W3C context for the originating tool span.
+        :param session_id: Omnigent session id, e.g. ``"conv_abc123"``.
+        :param agent: Name of the agent spec making the call.
+        :returns: The metadata mapping, or ``None`` when nothing is known
+            — MCP omits ``_meta`` entirely rather than sending an empty
+            object.
+        """
+        meta = {
+            "traceparent": traceparent,
+            "omnigent-session-id": session_id,
+            "omnigent-agent": agent,
+        }
+        present = {key: value for key, value in meta.items() if value}
+        return present or None
+
     async def call_tool(
         self,
         spec: AgentSpec,
@@ -469,7 +503,7 @@ class RunnerMcpManager:
                 bare_name,
                 arguments,
                 session_id=session_id,
-                meta={"traceparent": traceparent} if traceparent is not None else None,
+                meta=self._request_meta(traceparent, session_id, spec.name),
             )
         finally:
             if server_to_release is not None:
