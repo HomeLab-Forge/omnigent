@@ -55,6 +55,7 @@ from omnigent.inner.pi_executor import (
 from omnigent.model_catalog import ModelEntry
 from omnigent.model_metadata import ModelMetadata, ModelWireAPI
 from omnigent.runtime.harnesses._scaffold import PolicyVerdictPayload
+from omnigent.runtime.prompt import PI_TOOL_TURN_WEDGED_RESPONSE
 
 
 def _run(coro):
@@ -5619,8 +5620,31 @@ def test_pi_requests_recovery_after_a_failed_tool() -> None:
     _run(_test())
 
 
-def test_pi_fails_loud_after_bounded_empty_post_tool_continuations() -> None:
-    """Repeated empty completions fail instead of leaving the session idle."""
+def _silent_post_tool_rpc_lines() -> list[str]:
+    """Pi acknowledging each continuation and ending the turn with no text."""
+    return [
+        json.dumps({"type": "response", "success": True}),
+        json.dumps({"type": "agent_end", "messages": []}),
+        json.dumps({"type": "response", "success": True}),
+        json.dumps({"type": "agent_end", "messages": []}),
+        json.dumps({"type": "response", "success": True}),
+        json.dumps({"type": "agent_end", "messages": []}),
+    ]
+
+
+def _scripted_rpc(lines: list[str]) -> _PiRpcSession:
+    """A fake RPC session pre-loaded with ``lines``."""
+    rpc = _PiRpcSession()
+    rpc._line_queue = asyncio.Queue()
+    rpc.process = _FakeProcess()
+    rpc._stderr_lines = []
+    for line in lines:
+        rpc._line_queue.put_nowait(line)
+    return rpc
+
+
+def test_pi_restarts_behind_a_handover_after_bounded_empty_continuations() -> None:
+    """A spent continuation budget restarts Pi instead of failing the turn."""
 
     async def _test() -> None:
         executor = _executor_with_scripted_rpc(
@@ -5634,13 +5658,31 @@ def test_pi_fails_loud_after_bounded_empty_post_tool_continuations() -> None:
                         "result": {"content": "evidence"},
                     }
                 ),
-                json.dumps({"type": "agent_end", "messages": []}),
+                *_silent_post_tool_rpc_lines(),
+            ]
+        )
+        restarted = _scripted_rpc(
+            [
                 json.dumps({"type": "response", "success": True}),
-                json.dumps({"type": "agent_end", "messages": []}),
-                json.dumps({"type": "response", "success": True}),
+                json.dumps(
+                    {
+                        "type": "message_update",
+                        "assistantMessageEvent": {
+                            "type": "text_delta",
+                            "delta": "Resumed from the handover.",
+                        },
+                    }
+                ),
                 json.dumps({"type": "agent_end", "messages": []}),
             ]
         )
+        continuation: dict[str, str] = {}
+
+        async def fake_restart(**kwargs):
+            continuation["text"] = kwargs["continuation"]
+            return restarted
+
+        executor._restart_rpc_for_handover = fake_restart
 
         events = [
             event
@@ -5651,11 +5693,62 @@ def test_pi_fails_loud_after_bounded_empty_post_tool_continuations() -> None:
             )
         ]
 
-        errors = [event for event in events if isinstance(event, ExecutorError)]
-        assert len(errors) == 1
-        assert errors[0].retryable is True
-        assert "after 2 continuations" in errors[0].message
-        assert not any(isinstance(event, TurnComplete) for event in events)
+        assert not any(isinstance(event, ExecutorError) for event in events)
+        compacted = [event for event in events if isinstance(event, CompactionComplete)]
+        assert len(compacted) == 1
+        assert compacted[0].handover_loaded is True
+        assert compacted[0].handover["original_directive"] == "investigate"
+        assert "<session_handover>" in continuation["text"]
+        completed = [event for event in events if isinstance(event, TurnComplete)]
+        assert len(completed) == 1
+        assert completed[0].response == "Resumed from the handover."
+
+    _run(_test())
+
+
+def test_pi_hands_off_when_the_restarted_turn_stays_silent() -> None:
+    """A second silence ends the turn with a handoff, not a failed session."""
+
+    async def _test() -> None:
+        executor = _executor_with_scripted_rpc(
+            [
+                json.dumps({"type": "response", "success": True}),
+                json.dumps(
+                    {
+                        "type": "tool_execution_end",
+                        "toolName": "oracle__fetch",
+                        "isError": False,
+                        "result": {"content": "evidence"},
+                    }
+                ),
+                *_silent_post_tool_rpc_lines(),
+            ]
+        )
+        restarts = 0
+
+        async def fake_restart(**kwargs):
+            nonlocal restarts
+            restarts += 1
+            return _scripted_rpc(_silent_post_tool_rpc_lines())
+
+        executor._restart_rpc_for_handover = fake_restart
+
+        events = [
+            event
+            async for event in executor.run_turn(
+                [{"role": "user", "content": "investigate"}],
+                [],
+                "system",
+            )
+        ]
+
+        assert restarts == 1
+        assert not any(isinstance(event, ExecutorError) for event in events)
+        completed = [event for event in events if isinstance(event, TurnComplete)]
+        assert len(completed) == 1
+        assert completed[0].response == PI_TOOL_TURN_WEDGED_RESPONSE
+        chunks = [event for event in events if isinstance(event, TextChunk)]
+        assert chunks[-1].text == PI_TOOL_TURN_WEDGED_RESPONSE
 
     _run(_test())
 

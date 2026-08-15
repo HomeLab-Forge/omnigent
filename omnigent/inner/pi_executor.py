@@ -72,6 +72,8 @@ from omnigent.runtime.prompt import (
     PI_PRINTED_TOOL_RECOVERY,
     PI_PRINTED_TOOL_RECOVERY_WITH_SCHEMA,
     PI_TOOL_TURN_CONTINUATION,
+    PI_TOOL_TURN_WEDGED_RESPONSE,
+    PI_TOOL_TURN_WEDGED_SUMMARY,
     append_framework_instructions,
 )
 from omnigent.runtime.session_checkpoint import (
@@ -108,6 +110,10 @@ from .executor import (
 logger = logging.getLogger(__name__)
 
 _TOOL_TURN_MAX_CONTINUATIONS = 2
+# Restarts allowed per turn when Pi stops answering after its tool calls. The
+# restart drops the transcript that wedged it, so a second silence is no longer
+# a context problem and another restart would only replay the turn.
+_TOOL_TURN_MAX_WEDGE_RESTARTS = 1
 _TOOL_EXECUTION_MAX_SECONDS = 600.0
 _POST_TOOL_EVENT_IDLE_TIMEOUT_SECONDS = 70.0
 _PRINTED_TOOL_INTENT_MAX_CHARS = 4096
@@ -3144,6 +3150,10 @@ class PiExecutor(Executor):
         last_tool_failed = False
         failure_recovery_requested = False
         tool_turn_continuations = 0
+        wedge_restarts = 0
+        # Set by the continuation helpers when the caller must stop reading the
+        # event stream: the turn has already been ended or failed.
+        tool_turn_stop = False
         active_tool_calls = 0
         active_tool_started_at: float | None = None
         # Per-LLM-call token usage captured from each assistant message pi
@@ -3180,23 +3190,112 @@ class PiExecutor(Executor):
             name for name in (tool.get("name") for tool in tools) if isinstance(name, str)
         )
 
+        async def _restart_wedged_tool_turn() -> AsyncIterator[ExecutorEvent]:
+            """Recover a turn Pi abandoned after its tool calls.
+
+            A spent continuation budget means Pi is not coming back on its own,
+            and the usual cause is a transcript it can no longer answer over. So
+            take the smart-compaction path's remedy: a fresh process behind a
+            framework handover, which carries the directive and the calls
+            already made without the transcript that wedged it.
+            """
+            nonlocal rpc, cmd_id, handover_count, wedge_restarts
+            nonlocal handover_repository_state, pending_llm_input, pending_error
+            nonlocal saw_message_end, completion_text_ready, last_tool_failed
+            nonlocal failure_recovery_requested, tool_turn_continuations
+            nonlocal active_tool_calls, active_tool_started_at
+            nonlocal response_text, tool_turn_stop
+
+            tool_turn_stop = True
+            if wedge_restarts >= _TOOL_TURN_MAX_WEDGE_RESTARTS:
+                # A restarted process went silent too. End the turn with the
+                # handoff rather than an error: the tool results stand, and the
+                # session takes the next message.
+                logger.warning(
+                    "pi abandoned a tool-driven turn after %d restart(s); "
+                    "ending the turn with a handoff",
+                    wedge_restarts,
+                )
+                response_text = PI_TOOL_TURN_WEDGED_RESPONSE
+                yield TextChunk(text=PI_TOOL_TURN_WEDGED_RESPONSE)
+                turn_usage = _aggregate_pi_turn_usage(message_usages, model)
+                _notify_usage_from_dict(model=model, usage=turn_usage)
+                yield TurnComplete(
+                    response=response_text,
+                    usage=dict(turn_usage) if turn_usage is not None else None,
+                )
+                return
+
+            wedge_restarts += 1
+            logger.warning(
+                "pi ended a tool-driven turn without a final response after %d "
+                "continuations; restarting it behind a handover",
+                _TOOL_TURN_MAX_CONTINUATIONS,
+            )
+            if handover_repository_state is None:
+                handover_repository_state = cast(
+                    RepositoryState | None,
+                    await run_sync_on_thread(_capture_repository_state, self._cwd),
+                )
+            handover = _handover_from_compaction(
+                result={"summary": PI_TOOL_TURN_WEDGED_SUMMARY},
+                original_directive=original_directive,
+                repository_state=handover_repository_state,
+                context_tokens=handover_due_context_tokens,
+                completed_calls=tuple(completed_calls),
+                loaded_skills=tuple(loaded_skills),
+            )
+            continuation = _handover_continuation(handover)
+            handover_count += 1
+            cmd_id = f"turn_{id(messages)}_handover_{handover_count}"
+            try:
+                rpc = await self._restart_rpc_for_handover(
+                    session_key=session_key,
+                    current_rpc=rpc,
+                    system_prompt=pi_system_prompt,
+                    model=model,
+                    tools=tools,
+                    continuation=continuation,
+                    command_id=cmd_id,
+                )
+            except Exception as exc:  # noqa: BLE001
+                yield ExecutorError(
+                    message=f"Failed to restart Pi after an abandoned tool turn: {exc}",
+                    retryable=True,
+                )
+                return
+            pending_llm_input = [{"role": "user", "content": continuation}]
+            pending_error = None
+            saw_message_end = False
+            completion_text_ready = False
+            last_tool_failed = False
+            failure_recovery_requested = False
+            tool_turn_continuations = 0
+            active_tool_calls = 0
+            active_tool_started_at = None
+            tool_turn_stop = False
+            yield CompactionComplete(
+                summary=handover.fallback_summary,
+                token_count=0,
+                model=model,
+                compacted_messages=_handover_compacted_messages(handover),
+                handover=handover.model_dump(mode="json"),
+                handover_loaded=True,
+            )
+
         async def _continue_tool_turn(
             *,
             recover_failure: bool,
-        ) -> ExecutorError | None:
+        ) -> AsyncIterator[ExecutorEvent]:
             nonlocal completion_text_ready
             nonlocal failure_recovery_requested
             nonlocal tool_turn_continuations
+            nonlocal tool_turn_stop
 
             if tool_turn_continuations >= _TOOL_TURN_MAX_CONTINUATIONS:
-                return ExecutorError(
-                    message=(
-                        "Pi ended a tool-driven turn without a final "
-                        "assistant response after "
-                        f"{_TOOL_TURN_MAX_CONTINUATIONS} continuations."
-                    ),
-                    retryable=True,
-                )
+                async for restart_event in _restart_wedged_tool_turn():
+                    yield restart_event
+                return
             tool_turn_continuations += 1
             completion_text_ready = False
             if recover_failure:
@@ -3211,11 +3310,11 @@ class PiExecutor(Executor):
                     }
                 )
             except Exception as exc:  # noqa: BLE001
-                return ExecutorError(
+                tool_turn_stop = True
+                yield ExecutorError(
                     message=f"Failed to continue incomplete Pi tool turn: {exc}",
                     retryable=True,
                 )
-            return None
 
         while True:
             # After an errored message the only thing left to drain is the
@@ -3292,11 +3391,11 @@ class PiExecutor(Executor):
                     not completion_text_ready
                     or (last_tool_failed and not failure_recovery_requested)
                 ):
-                    continuation_error = await _continue_tool_turn(
+                    async for continuation_event in _continue_tool_turn(
                         recover_failure=(last_tool_failed and not failure_recovery_requested),
-                    )
-                    if continuation_error is not None:
-                        yield continuation_error
+                    ):
+                        yield continuation_event
+                    if tool_turn_stop:
                         return
                     continue
                 elif not streamed_any and not response_text:
@@ -3818,11 +3917,11 @@ class PiExecutor(Executor):
                     ):
                         needs_failure_recovery = False
                     if needs_completion_text or needs_failure_recovery:
-                        continuation_error = await _continue_tool_turn(
+                        async for continuation_event in _continue_tool_turn(
                             recover_failure=needs_failure_recovery,
-                        )
-                        if continuation_error is not None:
-                            yield continuation_error
+                        ):
+                            yield continuation_event
+                        if tool_turn_stop:
                             return
                         continue
                 # Fallback usage capture: if no ``message_end`` carried
