@@ -6,6 +6,7 @@ import logging
 import os
 import re
 import sys
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Literal, TypedDict, cast
 
@@ -317,6 +318,33 @@ def parse(root: Path, *, expand_env: bool = True) -> AgentSpec:
         agent_session_sharing=agent_session_sharing,
         framework_tools=framework_tools,
     )
+
+
+def _window_from_compaction_trigger(config: Mapping[str, object]) -> int | None:
+    """Derive the effective context window from a smart-compaction trigger.
+
+    An agent that rolls its context over at ``trigger_tokens`` never reaches
+    the model's physical window, so that trigger IS its effective window: it
+    is what the display ring should divide by and what compaction should
+    budget against. Stating both means writing one boundary down twice, and
+    a spec whose two numbers disagree is a bug nothing detects.
+
+    Only fills the gap. An explicit ``executor.context_window`` still wins,
+    for the case where an author means the physical window deliberately.
+
+    :param config: The parsed ``executor.config`` mapping.
+    :returns: The trigger as a positive int, or ``None`` when smart
+        compaction is absent, disabled, or carries no usable trigger.
+    """
+    compaction = config.get("smart_compaction")
+    if not isinstance(compaction, Mapping):
+        return None
+    if not compaction.get("enabled", False):
+        return None
+    trigger = compaction.get("trigger_tokens")
+    if isinstance(trigger, bool) or not isinstance(trigger, int) or trigger <= 0:
+        return None
+    return trigger
 
 
 def _parse_llm(
@@ -667,6 +695,8 @@ def _parse_executor(
     context_window: int | None = (
         _parse_int_field(raw_cw, "executor.context_window") if raw_cw is not None else None
     )
+    if context_window is None:
+        context_window = _window_from_compaction_trigger(config)
     raw_model = raw.get("model")
     model: str | None = str(raw_model) if raw_model is not None else None
     # Parse ``executor.connection:`` — same shape as ``llm.connection:``
