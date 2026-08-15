@@ -3879,3 +3879,47 @@ def test_config_loader_does_not_mutate_shared_safeloader_resolvers() -> None:
     # The subclass still narrows bools: ``on`` is a plain string, ``false`` a bool.
     assert yaml.load("on", loader) == "on"
     assert yaml.load("false", loader) is False
+
+
+# ── the effective window is stated once ───────────────────────
+
+
+def _executor(config: dict, **kw) -> object:
+    from omnigent.spec.parser import _parse_executor
+
+    return _parse_executor({"type": "omnigent", "config": config, **kw})
+
+
+def test_the_window_is_derived_from_the_compaction_trigger() -> None:
+    spec = _executor({"smart_compaction": {"enabled": True, "trigger_tokens": 56000}})
+
+    assert spec.context_window == 56000, (
+        "an agent that rolls over at 56000 never reaches the physical window, "
+        "so that trigger is its effective window"
+    )
+
+
+def test_an_explicit_window_still_wins() -> None:
+    spec = _executor(
+        {"smart_compaction": {"enabled": True, "trigger_tokens": 56000}},
+        context_window=131072,
+    )
+
+    assert spec.context_window == 131072
+
+
+def test_disabled_compaction_derives_nothing() -> None:
+    assert (
+        _executor({"smart_compaction": {"enabled": False, "trigger_tokens": 56000}}).context_window
+        is None
+    )
+
+
+def test_absent_compaction_derives_nothing() -> None:
+    assert _executor({}).context_window is None
+
+
+def test_a_malformed_trigger_is_ignored() -> None:
+    for trigger in (0, -1, "56000", True, None):
+        spec = _executor({"smart_compaction": {"enabled": True, "trigger_tokens": trigger}})
+        assert spec.context_window is None, f"trigger={trigger!r} must not be adopted"
