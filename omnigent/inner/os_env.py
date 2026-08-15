@@ -1334,7 +1334,7 @@ def _read_impl(
     effective_limit = len(lines) if limit is None else limit
     resolved_limit = min(len(lines), start + effective_limit)
     content = "".join(lines[start:resolved_limit])
-    return {
+    result: OpResult = {
         "path": str(path),
         "content": content,
         "encoding": "utf-8",
@@ -1343,6 +1343,26 @@ def _read_impl(
         "returned_lines": max(0, resolved_limit - start),
         "total_lines": len(lines),
     }
+
+    # A line count is not a size. Minified files put the whole document on one
+    # line, so the line limit above bounds nothing: a 382,882-character page
+    # came back under the 2,000-line default and saturated the context, which
+    # is the failure the line limit exists to prevent. The byte cap is the
+    # backstop, and it is the same one shell output already uses.
+    encoded = content.encode("utf-8")
+    if len(encoded) > _MAX_TOOL_OUTPUT_CHARS:
+        clipped = encoded[:_MAX_TOOL_OUTPUT_CHARS].decode("utf-8", "ignore")
+        result["content"] = clipped
+        result["returned_lines"] = len(clipped.splitlines())
+        result["truncated"] = True
+        result["total_bytes"] = len(encoded)
+        result["returned_bytes"] = len(clipped.encode("utf-8"))
+        result["note"] = (
+            f"Truncated to {_MAX_TOOL_OUTPUT_CHARS} bytes. Continue with a higher "
+            "offset, or use sys_os_shell when a single line is longer than the cap "
+            "and cannot be paged by line."
+        )
+    return result
 
 
 def _write_impl(path: Path, content: str) -> OpResult:
