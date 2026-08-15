@@ -625,6 +625,43 @@ module.exports = function(pi) {{
 """
 
 
+def _pi_settings_overlay(
+    retry_settings: Mapping[str, object],
+    smart_compaction: SmartCompactionConfig,
+) -> dict[str, object]:
+    """Build the settings block Omnigent merges into Pi's ``settings.json``.
+
+    Carries the retry budget, plus a compaction kill-switch when Omnigent is
+    running its own context rollover.
+
+    Pi auto-compacts whenever ``contextTokens > contextWindow - reserveTokens``
+    (``compaction.ts``), with ``reserveTokens`` defaulting to 16384 and
+    ``compaction.enabled`` defaulting to True. For a gateway model Pi has no
+    catalog entry for, its ``contextWindow`` is far below the real one, so it
+    fires early and often: measured in session c5723032, Pi compacted at
+    ``token_count = 20684`` against a smart_compaction ``trigger_tokens`` of
+    56000.
+
+    That is why the structured handover has never once run. Pi's own auto
+    compaction carries no ``customInstructions``, so the handover extension
+    returns at its first gate, Pi writes a prose summary instead, and Omnigent
+    falls back to the generic branch — every rollover, in every session. Two
+    compaction systems were racing and the one without the schema always won.
+
+    So when smart_compaction owns the rollover, Pi's is switched off. There is
+    exactly one context boundary after this, at ``trigger_tokens``, and it
+    carries the request the extension is waiting for.
+
+    :param retry_settings: ``RetryPolicy.pi.settings()`` output.
+    :param smart_compaction: The executor's smart-compaction config.
+    :returns: A settings mapping to merge into Pi's ``settings.json``.
+    """
+    overlay: dict[str, object] = dict(retry_settings)
+    if smart_compaction.enabled:
+        overlay["compaction"] = {"enabled": False}
+    return overlay
+
+
 def _generate_handover_extension_js(config: SmartCompactionConfig) -> str:
     """Generate the tools-disabled structured handover extension."""
     settings_json = json.dumps(
@@ -2800,7 +2837,10 @@ class PiExecutor(Executor):
 
             prepare_managed_pi_agent_dir(
                 pathlib.Path(tmp_dir),
-                overlay=self._retry_policy.pi.settings(),
+                overlay=_pi_settings_overlay(
+                    self._retry_policy.pi.settings(),
+                    self._smart_compaction,
+                ),
             )
 
         # Pi natively supports retry config via ``.pi/settings.json``
@@ -2809,7 +2849,10 @@ class PiExecutor(Executor):
         # Gateway runs apply retry via :func:`prepare_managed_pi_agent_dir`
         # into the managed agent dir instead.
         if not self._gateway:
-            retry_settings = self._retry_policy.pi.settings()
+            retry_settings = _pi_settings_overlay(
+                self._retry_policy.pi.settings(),
+                self._smart_compaction,
+            )
             settings_dir_root = self._cwd or tmp_dir
             settings_path = os.path.join(settings_dir_root, ".pi", "settings.json")
             try:
