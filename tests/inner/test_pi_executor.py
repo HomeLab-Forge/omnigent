@@ -6008,3 +6008,34 @@ def test_the_fallback_points_at_the_directive_not_the_summary() -> None:
 
     assert "directive" in handover.next_action.lower()
     assert "do_not_repeat" in handover.next_action
+
+
+# ── Pi's own auto-compaction must not race Omnigent's rollover ───
+
+
+def _overlay(enabled: bool, **kw):
+    from omnigent.inner.pi_executor import SmartCompactionConfig, _pi_settings_overlay
+
+    kw.setdefault("trigger_tokens", 56000)
+    return _pi_settings_overlay(
+        {"retry": {"maxRetries": 3}},
+        SmartCompactionConfig(enabled=enabled, **kw),
+    )
+
+
+def test_pi_compaction_is_off_when_omnigent_owns_the_rollover() -> None:
+    overlay = _overlay(True)
+
+    assert overlay["compaction"] == {"enabled": False}, (
+        "Pi compacted at 20684 tokens against a 56000 trigger, so its rollover "
+        "always won and the handover request was never delivered"
+    )
+
+
+def test_pi_compaction_is_left_alone_when_smart_compaction_is_off() -> None:
+    assert "compaction" not in _overlay(False)
+
+
+def test_the_retry_budget_still_rides_along() -> None:
+    for enabled in (True, False):
+        assert _overlay(enabled)["retry"] == {"maxRetries": 3}
