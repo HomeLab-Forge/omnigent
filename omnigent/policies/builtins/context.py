@@ -307,6 +307,13 @@ def detect_task_switch(
 
 _THRASHING_HISTORY_KEY = "_thrashing_results"
 
+# Outcomes of the round-trip in flight, before they are folded into the history
+# above. A model emits several tool calls from one response, so counting each
+# result separately treats one decision as many: five calls that all fail read
+# as five consecutive failures when the agent only chose once. Session d24accf4
+# tripped the five-error threshold that way, on a batch it could not revise.
+_THRASHING_BATCH_KEY = "_thrashing_batch"
+
 _ERROR_PREFIXES: tuple[str, ...] = (
     "error:",
     "error -",
@@ -375,6 +382,7 @@ def detect_thrashing(
     action: str = "ASK",
     reset_on_request: bool = True,
     latch: bool = False,
+    collapse_batches: bool = False,
 ) -> PolicyCallable:
     """Factory: detect when an agent is failing repeatedly.
 
@@ -432,19 +440,45 @@ def detect_thrashing(
             (abstain) for non-``tool_result`` events; ALLOW with
             updated state otherwise.
         """
+        effective_window = max(window, 1)
+        keep = max(effective_window, consecutive_threshold)
+
+        def _history(state: object) -> list[int]:
+            raw = state.get(_THRASHING_HISTORY_KEY) if isinstance(state, dict) else None
+            if isinstance(raw, list) and all(isinstance(value, int) for value in raw):
+                return raw
+            return []
+
         event_type = event.get("type")
         if event_type == "request" and reset_on_request:
+            return {
+                "result": "ALLOW",
+                "state_updates": [
+                    {"key": _THRASHING_HISTORY_KEY, "action": "set", "value": []},
+                    {"key": _THRASHING_BATCH_KEY, "action": "set", "value": None},
+                    *(_latch_release() if latch else []),
+                ],
+            }
+
+        # The model is about to be called again, so it has seen every result
+        # from the batch just executed. Fold that batch into one outcome.
+        if collapse_batches and event_type == "llm_request":
+            state = event.get("session_state") or {}
+            batch = state.get(_THRASHING_BATCH_KEY)
+            if not isinstance(batch, int):
+                return None
             return {
                 "result": "ALLOW",
                 "state_updates": [
                     {
                         "key": _THRASHING_HISTORY_KEY,
                         "action": "set",
-                        "value": [],
+                        "value": [*_history(state), batch][-keep:],
                     },
-                    *([_latch_release()] if latch else []),
+                    {"key": _THRASHING_BATCH_KEY, "action": "set", "value": None},
                 ],
             }
+
         if event_type != "tool_result":
             return None
 
@@ -458,26 +492,24 @@ def detect_thrashing(
         is_error = 1 if _looks_like_error(result_str) else 0
 
         state = event.get("session_state") or {}
-        raw_history = state.get(_THRASHING_HISTORY_KEY)
-        if isinstance(raw_history, list) and all(isinstance(v, int) for v in raw_history):
-            history: list[int] = raw_history
+        history = _history(state)
+
+        if collapse_batches:
+            # The batch counts as failed once any call in it fails, and stays
+            # provisional until the next round-trip flushes it. Checking
+            # against the provisional value keeps the guard able to fire
+            # inside a long batch without counting that batch more than once.
+            open_batch = state.get(_THRASHING_BATCH_KEY)
+            batch = max(open_batch if isinstance(open_batch, int) else 0, is_error)
+            updated = [*history, batch][-keep:]
+            carried: list[dict[str, object]] = [
+                {"key": _THRASHING_BATCH_KEY, "action": "set", "value": batch}
+            ]
         else:
-            history = []
+            updated = [*history, is_error][-keep:]
+            carried = [{"key": _THRASHING_HISTORY_KEY, "action": "set", "value": updated}]
 
-        effective_window = max(window, 1)
-        keep = max(effective_window, consecutive_threshold)
-        updated = [*history, is_error][-keep:]
-
-        state_update: PolicyResponse = {
-            "result": "ALLOW",
-            "state_updates": [
-                {
-                    "key": _THRASHING_HISTORY_KEY,
-                    "action": "set",
-                    "value": updated,
-                }
-            ],
-        }
+        state_update: PolicyResponse = {"result": "ALLOW", "state_updates": carried}
 
         # ── Consecutive check ──────────────────────────────────────
         if consecutive_threshold > 0 and len(updated) >= consecutive_threshold:
@@ -645,6 +677,17 @@ POLICY_REGISTRY: list[dict[str, object]] = [
                         "turn. Requires detect_loop with latch enabled; this "
                         "policy sees no tool_call events and cannot enforce "
                         "the latch on its own."
+                    ),
+                },
+                "collapse_batches": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": (
+                        "Count all the tool results of one LLM round-trip as a "
+                        "single outcome. A model emits several tool calls from "
+                        "one response, so counting each result separately reads "
+                        "one decision as many. Requires llm_request in the "
+                        "policy's event list."
                     ),
                 },
             },
