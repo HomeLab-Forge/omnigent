@@ -13,6 +13,7 @@ import hashlib as _hashlib
 import json as _json
 import re as _re
 from typing import Literal
+from urllib.parse import unquote as _unquote
 
 from omnigent.policies.schema import (
     PolicyCallable,
@@ -465,14 +466,123 @@ def _args_hash(tool_name: str, arguments: object) -> str:
     return _hashlib.sha256(blob.encode()).hexdigest()
 
 
+# ── Guard latch ──────────────────────────────────────────────────────────────
+#
+# A DENY suppresses one tool result. It does not end the turn, and an agent
+# under pressure reads the denial as a failed call and tries the next variant.
+# Session f5d06617 is the shape: the thrashing guard fired after five
+# consecutive errors with "End this approach and provide an incomplete-stop
+# handoff", and the agent made sixteen more tool calls.
+#
+# The latch closes that. Once a guard trips it, every later tool call in the
+# turn is denied with the same instruction, so continuing costs a round trip
+# and returns nothing. Summarising and asking is then the only move left, and
+# the instruction describes the situation instead of requesting cooperation.
+#
+# ``detect_loop`` is the enforcer because it is the policy that sees
+# ``tool_call``. ``detect_thrashing`` fires on ``tool_result`` and can only set
+# the latch, so latching it without also enabling ``detect_loop`` sets a flag
+# nothing reads.
+_GUARD_LATCH_KEY = "_policy_guard_latch"
+
+_GUARD_DO_NEXT = (
+    "do_next: stop calling tools. Summarize what you have established so far, "
+    "list what is blocking you, and ask the user one question."
+)
+
+
+def _latched_reason(state: object) -> str:
+    """Read the latched guard reason, if a guard has tripped this turn.
+
+    :param state: The event's ``session_state`` mapping.
+    :returns: The stored reason, or ``""`` when the latch is open.
+    """
+    if not isinstance(state, dict):
+        return ""
+    value = state.get(_GUARD_LATCH_KEY)
+    return value if isinstance(value, str) else ""
+
+
+def _latch_update(reason: str) -> dict[str, object]:
+    """Build the state update that closes the latch for the rest of the turn."""
+    return {"key": _GUARD_LATCH_KEY, "action": "set", "value": reason}
+
+
+def _latch_release() -> dict[str, object]:
+    """Build the state update that opens the latch on a new user turn."""
+    return {"key": _GUARD_LATCH_KEY, "action": "set", "value": ""}
+
+
+_URI_SCHEME_RE = _re.compile(r"^[a-z][a-z0-9+.-]*://")
+
+
+def _normalize_uri(value: str) -> str:
+    """Reduce one target expressed through different ref schemes to one key.
+
+    An agent that does not know a ref grammar guesses at it, and every guess
+    is a distinct argument tuple to a hash keyed on the raw arguments. In
+    session f5d06617 ``hub.docker.com/r/vaultwarden/server`` was fetched as a
+    bare URL twice and as ``web://…`` once, and
+    ``vaultwarden/vaultwarden@main/README.md`` was fetched under ``repo://``
+    three times with the ``source`` argument varied. Nine calls, two targets,
+    no repeat the loop guard could see.
+
+    Percent-decoding runs first so ``web://https%3A%2F%2Fhost`` reaches the
+    same key as ``https://host``, then schemes are stripped repeatedly because
+    a wrapped ref carries two.
+
+    :param value: A raw string argument value.
+    :returns: The target with scheme, escaping, trailing slash, and case
+        removed.
+    """
+    text = _unquote(value.strip())
+    for _ in range(3):
+        stripped = _URI_SCHEME_RE.sub("", text, count=1)
+        if stripped == text:
+            break
+        text = stripped
+    return text.rstrip("/").lower()
+
+
+def _normalized_arguments(
+    arguments: object,
+    *,
+    ignore_keys: frozenset[str],
+    normalize_uris: bool,
+) -> object:
+    """Project a tool-call argument mapping down to its loop-detection key.
+
+    :param arguments: The raw ``arguments`` value from the tool-call event.
+    :param ignore_keys: Argument names dropped before hashing, for fields that
+        select a backend rather than a target (Oracle's ``source``).
+    :param normalize_uris: Whether string values are reduced by
+        :func:`_normalize_uri`.
+    :returns: The mapping to hash, or *arguments* unchanged when neither
+        option is configured or the value is not a mapping.
+    """
+    if not isinstance(arguments, dict) or not (ignore_keys or normalize_uris):
+        return arguments
+    projected: dict[str, object] = {}
+    for key, value in arguments.items():
+        if key in ignore_keys:
+            continue
+        projected[key] = (
+            _normalize_uri(value) if normalize_uris and isinstance(value, str) else value
+        )
+    return projected
+
+
 def detect_loop(
     window: int = 10,
     threshold: int = 3,
     action: Literal["ASK", "DENY"] = "ASK",
     exempt_tools: list[str] | None = None,
     reset_on_request: bool = True,
+    ignore_arg_keys: list[str] | None = None,
+    normalize_uri_args: bool = False,
+    latch: bool = False,
 ) -> PolicyCallable:
-    """Factory: detect repeated identical tool calls.
+    """Factory: detect repeated tool calls against the same target.
 
     Tracks recent tool-call hashes in ``session_state`` as a
     bounded list of SHA-256 hex digests keyed by
@@ -481,9 +591,14 @@ def detect_loop(
     returns the configured action so the loop can end with a handoff.
 
     This catches the #1 token-waste pattern — an agent retrying
-    the exact same failing tool call — which
+    the same failing tool call — which
     ``max_tool_calls_per_session`` cannot detect because it only
     counts total calls.
+
+    By default the hash covers the raw arguments, so a retry counts only
+    when it is byte-identical. *ignore_arg_keys* and *normalize_uri_args*
+    widen it to the call's target, which is what catches an agent guessing
+    at a ref grammar rather than repeating one ref.
 
     :param window: Number of recent calls to consider.
         Defaults to ``10``. Clamped to a minimum of ``1``.
@@ -494,12 +609,24 @@ def detect_loop(
     :param exempt_tools: Tool names allowed to repeat, such as a bounded
         async-result poll.
     :param reset_on_request: Clear loop history for each user turn.
-    :returns: A policy callable that detects identical retries.
+    :param ignore_arg_keys: Argument names dropped before hashing. Use for
+        fields that pick a backend rather than a target, so varying one does
+        not read as a new call — Oracle's ``source`` is the case this exists
+        for.
+    :param normalize_uri_args: Reduce string arguments to their target before
+        hashing: percent-decode, strip ``scheme://`` prefixes, drop a trailing
+        slash, lowercase. Collapses ``web://https%3A%2F%2Fhost/p``,
+        ``web://https://host/p`` and ``https://host/p`` to one key.
+    :param latch: Once this guard or ``detect_thrashing`` trips, deny every
+        remaining tool call in the turn with the same instruction, instead of
+        denying one result and letting the agent try the next variant.
+    :returns: A policy callable that detects repeated calls on one target.
     """
     window = max(1, window)
     threshold = max(1, threshold)
     normalized_action = action.upper() if action.upper() in {"ASK", "DENY"} else "ASK"
     exempt = frozenset(exempt_tools or [])
+    ignore_keys = frozenset(ignore_arg_keys or [])
 
     def evaluate(event: PolicyEvent) -> PolicyResponse:
         """Evaluate whether the current tool call is a repeated loop.
@@ -513,6 +640,7 @@ def detect_loop(
                 "result": "ALLOW",
                 "state_updates": [
                     {"key": _LOOP_STATE_KEY, "action": "set", "value": []},
+                    *([_latch_release()] if latch else []),
                 ],
             }
         if event_type != "tool_call":
@@ -524,7 +652,19 @@ def detect_loop(
         tool_name = data.get("name", "")
         if tool_name in exempt:
             return _ALLOW
-        arguments = data.get("arguments", {})
+
+        # A guard already tripped this turn. Nothing the agent calls now can
+        # make progress, so say so rather than denying one call at a time.
+        if latch:
+            latched = _latched_reason(event.get("session_state"))
+            if latched:
+                return {"result": normalized_action, "reason": latched}
+
+        arguments = _normalized_arguments(
+            data.get("arguments", {}),
+            ignore_keys=ignore_keys,
+            normalize_uris=normalize_uri_args,
+        )
         h = _args_hash(tool_name, arguments)
 
         state = event.get("session_state") or {}
@@ -541,15 +681,20 @@ def detect_loop(
 
         count = recent.count(h)
         if count >= threshold:
+            repeated = (
+                "the same target" if (ignore_keys or normalize_uri_args) else "identical arguments"
+            )
+            reason = (
+                f"Loop guard: tool '{tool_name}' was called with {repeated} "
+                f"{count} times in the last {len(recent)} calls. Rephrasing the "
+                f"arguments will not change the result. {_GUARD_DO_NEXT}"
+            )
             return {
                 "result": normalized_action,
-                "reason": (
-                    f"Loop guard: tool '{tool_name}' was called with identical "
-                    f"arguments {count} times in the last {len(recent)} calls. "
-                    "End this approach and provide an incomplete-stop handoff."
-                ),
+                "reason": reason,
                 "state_updates": [
                     {"key": _LOOP_STATE_KEY, "action": "set", "value": recent},
+                    *([_latch_update(reason)] if latch else []),
                 ],
             }
 
@@ -1057,9 +1202,11 @@ POLICY_REGISTRY: list[dict[str, object]] = [
         "handler": "omnigent.policies.builtins.safety.detect_loop",
         "kind": "factory",
         "name": "Detect Tool Call Retry Loops",
-        "description": "Detects when the agent is stuck retrying the same tool call with "
-        "identical arguments. Returns the configured action when the same "
-        "(tool, args) repeats N times within a sliding window of recent calls",
+        "description": "Detects when the agent is stuck retrying the same tool call. "
+        "Returns the configured action when the same (tool, args) repeats N times "
+        "within a sliding window of recent calls. Set ignore_arg_keys and "
+        "normalize_uri_args to key on the call's target instead, which catches an "
+        "agent guessing at a ref grammar rather than repeating one ref",
         "params_schema": {
             "type": "object",
             "properties": {
@@ -1091,6 +1238,25 @@ POLICY_REGISTRY: list[dict[str, object]] = [
                     "type": "boolean",
                     "description": "Clear recent-call history for each user turn",
                     "default": True,
+                },
+                "ignore_arg_keys": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Argument names dropped before hashing, for fields "
+                    "that pick a backend rather than a target",
+                    "default": [],
+                },
+                "normalize_uri_args": {
+                    "type": "boolean",
+                    "description": "Key string arguments on their target: percent-decode, "
+                    "strip scheme:// prefixes, drop a trailing slash, lowercase",
+                    "default": False,
+                },
+                "latch": {
+                    "type": "boolean",
+                    "description": "Once this guard or the thrashing guard trips, deny "
+                    "every remaining tool call in the turn with the same instruction",
+                    "default": False,
                 },
             },
         },

@@ -9,11 +9,20 @@ Covers:
 - Non-tool_call phases pass through.
 - State updates are always emitted (the window advances on every call).
 - Custom window/threshold parameters.
+- Target-keyed detection via ``ignore_arg_keys`` / ``normalize_uri_args``.
+- The guard latch denying the rest of the turn once tripped.
 """
 
 from __future__ import annotations
 
-from omnigent.policies.builtins.safety import _LOOP_STATE_KEY, _args_hash, detect_loop
+from omnigent.policies.builtins.safety import (
+    _GUARD_LATCH_KEY,
+    _LOOP_STATE_KEY,
+    _args_hash,
+    _normalize_uri,
+    _normalized_arguments,
+    detect_loop,
+)
 from tests.policies.builtins.helpers import tool_call_event as tc
 
 
@@ -215,7 +224,8 @@ def test_detect_loop_can_deny_without_user_prompt() -> None:
     )
 
     assert result["result"] == "DENY"
-    assert "incomplete-stop handoff" in result["reason"]
+    assert "Summarize what you have established" in result["reason"]
+    assert "ask the user one question" in result["reason"]
 
 
 def test_detect_loop_exempts_bounded_poll_tool() -> None:
@@ -275,3 +285,109 @@ def test_args_hash_different_args() -> None:
     h1 = _args_hash("tool", {"x": 1})
     h2 = _args_hash("tool", {"x": 2})
     assert h1 != h2
+
+
+# ── Target-keyed detection ─────────────────────────────────────────────────
+#
+# The refs below are verbatim from session f5d06617, where an agent that did
+# not know Oracle's ref grammar guessed at it. Every guess was a distinct
+# argument tuple, so the raw-argument hash never saw a repeat.
+
+
+def test_normalize_uri_collapses_scheme_and_escaping() -> None:
+    """One target reached through three spellings keys the same."""
+    target = "hub.docker.com/r/vaultwarden/server"
+    assert _normalize_uri("https://hub.docker.com/r/vaultwarden/server") == target
+    assert _normalize_uri("web://https://hub.docker.com/r/vaultwarden/server") == target
+    escaped = "web://https%3A%2F%2Fhub.docker.com%2Fr%2Fvaultwarden%2Fserver/"
+    assert _normalize_uri(escaped) == target
+
+
+def test_normalized_arguments_drops_ignored_keys() -> None:
+    """A backend selector does not make a call distinct."""
+    args = {"ref": "repo://vaultwarden/vaultwarden@main/README.md", "source": "code"}
+    projected = _normalized_arguments(args, ignore_keys=frozenset({"source"}), normalize_uris=True)
+    assert projected == {"ref": "vaultwarden/vaultwarden@main/readme.md"}
+
+
+def test_normalized_arguments_passthrough_when_unconfigured() -> None:
+    """With neither option set the raw arguments are hashed unchanged."""
+    args = {"ref": "web://x", "source": "web"}
+    assert _normalized_arguments(args, ignore_keys=frozenset(), normalize_uris=False) is args
+
+
+def test_detect_loop_keys_on_target_not_arguments() -> None:
+    """Same ref under a varied scheme and source counts as a repeat."""
+    policy = detect_loop(
+        window=12,
+        threshold=3,
+        action="DENY",
+        ignore_arg_keys=["source"],
+        normalize_uri_args=True,
+    )
+    h = _args_hash("oracle__fetch", {"ref": "vaultwarden/vaultwarden@main/readme.md"})
+
+    result = policy(
+        tc(
+            "oracle__fetch",
+            {"ref": "web://https://vaultwarden/vaultwarden@main/README.md", "source": "web"},
+            _state_with_hashes([h, h]),
+        )
+    )
+    assert result["result"] == "DENY"
+    assert "the same target" in result["reason"]
+
+
+def test_detect_loop_raw_arguments_miss_the_same_sequence() -> None:
+    """Without the options the same three calls do not register a repeat."""
+    policy = detect_loop(window=12, threshold=3, action="DENY")
+    h = _args_hash("oracle__fetch", {"ref": "vaultwarden/vaultwarden@main/readme.md"})
+
+    result = policy(
+        tc(
+            "oracle__fetch",
+            {"ref": "web://https://vaultwarden/vaultwarden@main/README.md", "source": "web"},
+            _state_with_hashes([h, h]),
+        )
+    )
+    assert result["result"] == "ALLOW"
+
+
+# ── Guard latch ────────────────────────────────────────────────────────────
+
+
+def test_latch_closes_on_trip() -> None:
+    """Tripping stores the reason so later calls read the same instruction."""
+    policy = detect_loop(window=10, threshold=3, action="DENY", latch=True)
+    h = _args_hash("sys_os_shell", {"command": "ls"})
+
+    result = policy(tc("sys_os_shell", {"command": "ls"}, _state_with_hashes([h, h])))
+    latch = [u for u in result["state_updates"] if u["key"] == _GUARD_LATCH_KEY]
+    assert latch and latch[0]["value"] == result["reason"]
+
+
+def test_latched_turn_denies_an_unrelated_tool() -> None:
+    """Once latched, a different tool on a different target is denied too."""
+    policy = detect_loop(window=10, threshold=3, action="DENY", latch=True)
+    state = {_GUARD_LATCH_KEY: "Loop guard: earlier trip."}
+
+    result = policy(tc("sys_os_read", {"path": "/some/other/file"}, state))
+    assert result["result"] == "DENY"
+    assert result["reason"] == "Loop guard: earlier trip."
+
+
+def test_latch_releases_on_a_new_user_turn() -> None:
+    """A fresh instruction reopens the latch."""
+    policy = detect_loop(window=10, threshold=3, action="DENY", latch=True)
+    event = {"type": "request", "data": {}, "session_state": {_GUARD_LATCH_KEY: "tripped"}}
+    result = policy(event)
+    assert {"key": _GUARD_LATCH_KEY, "action": "set", "value": ""} in result["state_updates"]
+
+
+def test_latch_off_by_default() -> None:
+    """An unlatched guard denies one call and writes no latch."""
+    policy = detect_loop(window=10, threshold=3, action="DENY")
+    h = _args_hash("sys_os_shell", {"command": "ls"})
+
+    result = policy(tc("sys_os_shell", {"command": "ls"}, _state_with_hashes([h, h])))
+    assert all(u["key"] != _GUARD_LATCH_KEY for u in result["state_updates"])

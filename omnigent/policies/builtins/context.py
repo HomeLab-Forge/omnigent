@@ -16,6 +16,11 @@ import logging
 import re
 from typing import Literal
 
+from omnigent.policies.builtins.safety import (
+    _GUARD_DO_NEXT,
+    _latch_release,
+    _latch_update,
+)
 from omnigent.policies.schema import (
     PolicyCallable,
     PolicyEvent,
@@ -369,6 +374,7 @@ def detect_thrashing(
     window_error_rate: float = 0.8,
     action: str = "ASK",
     reset_on_request: bool = True,
+    latch: bool = False,
 ) -> PolicyCallable:
     """Factory: detect when an agent is failing repeatedly.
 
@@ -401,6 +407,14 @@ def detect_thrashing(
     :param action: Response when thrashing is detected — ``"ASK"``
         (default) or ``"DENY"``.
     :param reset_on_request: Clear result history for each user turn.
+    :param latch: Close the shared guard latch on detection, so
+        ``detect_loop`` denies every remaining tool call in the turn.
+        This policy fires on ``tool_result`` and never sees a
+        ``tool_call``, so it can only set the latch — enabling it here
+        without also enabling ``detect_loop`` writes a flag nothing
+        reads. Set it when the denial alone is not ending the turn:
+        observed in session f5d06617, where the agent took the
+        five-consecutive-errors denial and made sixteen more calls.
     :returns: A policy callable that fires on ``tool_result`` events.
     """
     normalised_action = _normalise_action(action, policy_name="detect_thrashing")
@@ -427,7 +441,8 @@ def detect_thrashing(
                         "key": _THRASHING_HISTORY_KEY,
                         "action": "set",
                         "value": [],
-                    }
+                    },
+                    *([_latch_release()] if latch else []),
                 ],
             }
         if event_type != "tool_result":
@@ -468,14 +483,17 @@ def detect_thrashing(
         if consecutive_threshold > 0 and len(updated) >= consecutive_threshold:
             tail = updated[-consecutive_threshold:]
             if all(v == 1 for v in tail):
+                reason = (
+                    f"Loop guard: the agent produced {consecutive_threshold} "
+                    f"consecutive tool errors. {_GUARD_DO_NEXT}"
+                )
                 return {
                     "result": normalised_action,
-                    "reason": (
-                        f"Loop guard: the agent produced {consecutive_threshold} "
-                        "consecutive tool errors. End this approach and provide "
-                        "an incomplete-stop handoff."
-                    ),
-                    "state_updates": state_update["state_updates"],
+                    "reason": reason,
+                    "state_updates": [
+                        *state_update["state_updates"],
+                        *([_latch_update(reason)] if latch else []),
+                    ],
                 }
 
         # ── Window rate check ──────────────────────────────────────
@@ -484,14 +502,17 @@ def detect_thrashing(
             rate = sum(rate_window) / len(rate_window)
             if rate >= window_error_rate:
                 pct = int(rate * 100)
+                reason = (
+                    f"Loop guard: tool results had a {pct}% error rate over "
+                    f"the last {effective_window} calls. {_GUARD_DO_NEXT}"
+                )
                 return {
                     "result": normalised_action,
-                    "reason": (
-                        f"Loop guard: tool results had a {pct}% error rate over "
-                        f"the last {effective_window} calls. End this approach "
-                        "and provide an incomplete-stop handoff."
-                    ),
-                    "state_updates": state_update["state_updates"],
+                    "reason": reason,
+                    "state_updates": [
+                        *state_update["state_updates"],
+                        *([_latch_update(reason)] if latch else []),
+                    ],
                 }
 
         return state_update
@@ -614,6 +635,17 @@ POLICY_REGISTRY: list[dict[str, object]] = [
                     "type": "boolean",
                     "default": True,
                     "description": "Clear result history for each user turn.",
+                },
+                "latch": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": (
+                        "Close the shared guard latch on detection so "
+                        "detect_loop denies every remaining tool call in the "
+                        "turn. Requires detect_loop with latch enabled; this "
+                        "policy sees no tool_call events and cannot enforce "
+                        "the latch on its own."
+                    ),
                 },
             },
             "required": [],
