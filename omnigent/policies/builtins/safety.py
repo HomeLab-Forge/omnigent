@@ -8,6 +8,7 @@ Python. Each callable follows the :class:`PolicyEvent` →
 
 from __future__ import annotations
 
+import fnmatch as _fnmatch
 import hashlib as _hashlib
 import json as _json
 import re as _re
@@ -220,6 +221,129 @@ def tool_budget_per_turn(
 
 _LOOP_STATE_KEY = "_policy_loop_recent_hashes"
 _PROGRESS_STATE_KEY = "_policy_calls_since_progress"
+_EVIDENCE_STATE_KEY = "_policy_evidence_seen"
+
+
+def require_evidence_before_write(
+    paths: list[str] | None = None,
+    evidence_skills: list[str] | None = None,
+    evidence_tools: list[str] | None = None,
+    write_tools: list[str] | None = None,
+    action: Literal["ASK", "DENY"] = "DENY",
+) -> PolicyCallable:
+    """Factory: refuse to author a file the session has no evidence for.
+
+    Some files state a contract the agent cannot derive from the repository:
+    a third-party service's environment variables, an image tag, an upstream
+    API's field names. Reading more of your own code never establishes them,
+    so an agent that only reads locally will write them from memory, fluently
+    and wrongly. Observed: a password-vault service authored with four
+    invented environment variables, a database configured through fields that
+    do not exist, and a comment asserting a setting that was never set.
+
+    The mechanism is deliberately empty of policy. WHICH files carry a
+    contract, and WHAT counts as having checked, are the agent author's
+    judgement and arrive as parameters. This keeps the repository-specific
+    part in the spec, where it can change without a release, and keeps the
+    rule itself short enough that the model meets it once, at the moment it
+    matters, rather than as one more line in a prompt it read ten thousand
+    tokens ago.
+
+    Evidence is session-scoped and never expires: having checked upstream
+    once, the agent may keep writing. The guard exists to prevent authoring
+    blind, not to demand a lookup per file.
+
+    :param paths: Glob patterns, matched against the write's ``path``
+        argument, naming files that state an external contract, e.g.
+        ``["**/compose.yaml", "**/blueprints/*.yaml"]``. Empty disables the
+        policy.
+    :param evidence_skills: Skill names whose loading counts as evidence,
+        e.g. ``["research"]``.
+    :param evidence_tools: Tool names whose use counts as evidence, e.g. a
+        documentation fetch.
+    :param write_tools: Tools treated as authoring. Defaults to
+        ``["sys_os_write", "sys_os_edit"]``.
+    :param action: ``"ASK"`` or ``"DENY"`` when evidence is missing.
+    :returns: A policy callable that gates authorship on evidence.
+    """
+    patterns = tuple(paths or ())
+    skills = frozenset(evidence_skills or ())
+    tools = frozenset(evidence_tools or ())
+    writers = frozenset(write_tools or ["sys_os_write", "sys_os_edit"])
+    normalized_action = action.upper() if action.upper() in {"ASK", "DENY"} else "DENY"
+
+    def _matches(path: str) -> bool:
+        # Match the whole path and the bare name, so a caller may write either
+        # "**/compose.yaml" or "compose.yaml" and mean the same thing.
+        tail = path.rsplit("/", 1)[-1]
+        return any(
+            _fnmatch.fnmatch(path, pattern) or _fnmatch.fnmatch(tail, pattern)
+            for pattern in patterns
+        )
+
+    def evaluate(event: PolicyEvent) -> PolicyResponse:
+        """Evaluate whether this write has the evidence behind it.
+
+        :param event: Policy event dict.
+        :returns: The configured action for an unevidenced write, else ALLOW.
+        """
+        if event.get("type") != "tool_call" or not patterns:
+            return _ALLOW
+        data = event.get("data")
+        if not isinstance(data, dict):
+            return _ALLOW
+
+        tool_name = data.get("name", "")
+        arguments = data.get("arguments")
+        arguments = arguments if isinstance(arguments, dict) else {}
+
+        state = event.get("session_state") or {}
+        raw_seen = state.get(_EVIDENCE_STATE_KEY)
+        seen = (
+            [item for item in raw_seen if isinstance(item, str)]
+            if isinstance(raw_seen, list)
+            else []
+        )
+
+        # Record evidence. load_skill is checked by the skill it names, every
+        # other tool by its own name.
+        found = None
+        if tool_name == "load_skill":
+            skill = arguments.get("name")
+            if isinstance(skill, str) and skill in skills:
+                found = f"skill:{skill}"
+        elif tool_name in tools:
+            found = f"tool:{tool_name}"
+        if found is not None and found not in seen:
+            return {
+                "result": "ALLOW",
+                "state_updates": [
+                    {"key": _EVIDENCE_STATE_KEY, "action": "set", "value": [*seen, found]},
+                ],
+            }
+
+        if tool_name not in writers or seen:
+            return _ALLOW
+        path = arguments.get("path")
+        if not isinstance(path, str) or not _matches(path):
+            return _ALLOW
+
+        wanted = sorted({*(f"the {name} skill" for name in skills), *tools})
+        return {
+            "result": normalized_action,
+            "reason": (
+                f"Evidence guard: {path} states a contract owned by something "
+                "outside this repository — environment variable names, image "
+                "tags, endpoints — and nothing in this session has checked what "
+                "that contract actually is. Reading more of our own code cannot "
+                "establish it. Check the primary source first"
+                + (f" using {' or '.join(wanted)}" if wanted else "")
+                + ", then write. Names copied from memory are the failure this "
+                "guard exists to catch."
+            ),
+        }
+
+    return evaluate
 
 
 def require_progress(
@@ -967,6 +1091,50 @@ POLICY_REGISTRY: list[dict[str, object]] = [
                     "type": "boolean",
                     "description": "Clear recent-call history for each user turn",
                     "default": True,
+                },
+            },
+        },
+    },
+    {
+        "handler": "omnigent.policies.builtins.safety.require_evidence_before_write",
+        "kind": "factory",
+        "name": "Require Evidence Before Authoring A Contract",
+        "description": "Denies writing a file that states a contract owned outside the "
+        "repository (third-party env vars, image tags, endpoints) until the session has "
+        "consulted a primary source. Which files and what counts as evidence are the "
+        "agent author's parameters, not policy baked in here",
+        "params_schema": {
+            "type": "object",
+            "properties": {
+                "paths": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Globs naming files that state an external contract",
+                    "default": [],
+                },
+                "evidence_skills": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Skill names whose loading counts as evidence",
+                    "default": [],
+                },
+                "evidence_tools": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Tool names whose use counts as evidence",
+                    "default": [],
+                },
+                "write_tools": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Tools treated as authoring",
+                    "default": ["sys_os_write", "sys_os_edit"],
+                },
+                "action": {
+                    "type": "string",
+                    "enum": ["ASK", "DENY"],
+                    "description": "Response when evidence is missing",
+                    "default": "DENY",
                 },
             },
         },
