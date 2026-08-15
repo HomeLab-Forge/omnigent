@@ -252,3 +252,26 @@ def test_declared_passthrough_tolerates_a_missing_chain():
 
     assert declared_passthrough(None) == ()
     assert declared_passthrough(_NoSandbox()) == ()
+
+
+# ── Session identity reaches os tools ───────────────────────────────────────
+
+
+def test_session_id_survives_the_env_scrub() -> None:
+    """`os_env: caller_process` runs a shell tool in the runner's environment.
+
+    A script the agent invokes has no other way to learn which session it
+    belongs to, so it cannot file artifacts under that session's directory.
+    """
+    from omnigent.inner.agent_env import clean_agent_env
+    from omnigent.runner.identity import OMNIGENT_SESSION_ID_ENV_VAR
+
+    cleaned = clean_agent_env(
+        source={
+            OMNIGENT_SESSION_ID_ENV_VAR: "26dba3cd",
+            "AWS_SECRET_ACCESS_KEY": "x",
+            "PATH": "/bin",
+        }
+    )
+    assert cleaned[OMNIGENT_SESSION_ID_ENV_VAR] == "26dba3cd"
+    assert "AWS_SECRET_ACCESS_KEY" not in cleaned

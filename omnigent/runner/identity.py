@@ -52,6 +52,18 @@ RUNNER_ISOLATE_SESSION_ENV_VAR = "OMNIGENT_RUNNER_ISOLATE_SESSION"
 OMNIGENT_SESSION_ENV_VAR = "OMNIGENT"
 OMNIGENT_SESSION_ENV_VALUE = "1"
 
+# The session a tool call belongs to, for scripts the agent runs itself.
+# ``os_env: caller_process`` executes a shell tool in the runner's own
+# environment, so a script invoked that way has no other way to learn which
+# session it is part of, and cannot file its artifacts under that session's
+# directory.
+#
+# Set only while the runner serves exactly one session. A runner that picks up
+# a second one cannot name both, so the variable is removed rather than left
+# pointing at whichever registered first: a script reading a stale id would
+# write into another session's directory, which is worse than writing nowhere.
+OMNIGENT_SESSION_ID_ENV_VAR = "OMNIGENT_SESSION_ID"
+
 # Env vars carrying the runner's control-plane auth secret. The tunnel
 # binding token is seeded into the runner process by the launcher and
 # reused as the runner-side request auth token, but must never reach a

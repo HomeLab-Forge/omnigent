@@ -23,7 +23,10 @@ from __future__ import annotations
 import os
 from collections.abc import Iterable, Mapping
 
-from omnigent.runner.identity import OMNIGENT_SESSION_ENV_VAR
+from omnigent.runner.identity import (
+    OMNIGENT_SESSION_ENV_VAR,
+    OMNIGENT_SESSION_ID_ENV_VAR,
+)
 
 # Categories every POSIX CLI needs regardless of vendor: where the user's
 # config lives, how to reach the network, how to format output, where to put
@@ -58,6 +61,10 @@ BASE_ALLOW_EXACT: frozenset[str] = frozenset(
         # every harness that does not happen to own a NODE_ prefix of its own.
         "NODE_EXTRA_CA_CERTS",
         OMNIGENT_SESSION_ENV_VAR,
+        # Carries no credential — it is the conversation id already visible in
+        # the session URL — and a harness that shells out needs it to write
+        # into the right session's directory.
+        OMNIGENT_SESSION_ID_ENV_VAR,
     }
 )
 
