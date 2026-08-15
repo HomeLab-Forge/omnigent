@@ -640,6 +640,12 @@ const SETTINGS = {settings_json};
 const REQUEST_PREFIX = "OMNIGENT_STRUCTURED_HANDOVER_V1\\n";
 const FIRST_KEPT_SENTINEL = "__omnigent_handover_v1__";
 
+// Every failure path here used to `return` silently, so a fallback handover was
+// indistinguishable from one that never ran. stderr is the runner log.
+function bail(why) {{
+  try {{ console.error("[omnigent-handover] giving up: " + why); }} catch (_e) {{}}
+}}
+
 function renderEntry(entry) {{
   if (!entry || typeof entry !== "object") return "";
   if (entry.type === "message" && entry.message) {{
@@ -680,12 +686,13 @@ module.exports = function(pi) {{
   pi.on("session_before_compact", async (event, ctx) => {{
     const instructions = event && event.customInstructions;
     if (typeof instructions !== "string" || !instructions.startsWith(REQUEST_PREFIX)) return;
-    if (!ctx.model) return;
+    if (!ctx.model) {{ bail("no model on the compaction context"); return; }}
 
     let request;
     try {{
       request = JSON.parse(instructions.slice(REQUEST_PREFIX.length));
-    }} catch (_error) {{
+    }} catch (error) {{
+      bail("request payload did not parse: " + error);
       return;
     }}
 
@@ -712,7 +719,7 @@ module.exports = function(pi) {{
             role: "user",
             content: [{{
               type: "text",
-              text: JSON.stringify(request) + "\\n\\n<conversation>\\n"
+              text: REQUEST_PREFIX + JSON.stringify(request) + "\\n\\n<conversation>\\n"
                 + transcript + "\\n</conversation>"
             }}],
             timestamp: Date.now()
@@ -720,7 +727,8 @@ module.exports = function(pi) {{
         }},
         completionOptions
       );
-    }} catch (_error) {{
+    }} catch (error) {{
+      bail("handover completion failed: " + error);
       return;
     }}
 
@@ -732,10 +740,14 @@ module.exports = function(pi) {{
     let draft;
     try {{
       draft = extractJson(text);
-    }} catch (_error) {{
+    }} catch (error) {{
+      bail("model did not return JSON (" + text.length + " chars): " + error);
       return;
     }}
-    if (!draft || typeof draft !== "object") return;
+    if (!draft || typeof draft !== "object") {{
+      bail("parsed handover was not an object");
+      return;
+    }}
     draft.original_directive = request.original_directive;
 
     const summary = "Structured session handover:\\n" + JSON.stringify(draft, null, 2);
