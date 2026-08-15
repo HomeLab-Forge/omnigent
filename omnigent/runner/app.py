@@ -82,6 +82,7 @@ from omnigent.runner.background_titles import (
 )
 from omnigent.runner.background_titles.service import BACKGROUND_TITLE_MAX_PROMPT_CHARS
 from omnigent.runner.codex.goal import CodexGoalRunner
+from omnigent.runner.identity import OMNIGENT_SESSION_ID_ENV_VAR
 from omnigent.runner.native import (
     _AUTO_OPENCODE_SERVERS,
     _COST_POPUP_REPOP_TASKS,
@@ -8400,12 +8401,25 @@ def create_runner_app(
             },
         )
 
+    def _publish_session_id(session_id: str) -> None:
+        """Name the current session in the environment os tools inherit.
+
+        See :data:`omnigent.runner.identity.OMNIGENT_SESSION_ID_ENV_VAR` for
+        why this is unset rather than overwritten once a second session
+        appears.
+        """
+        if len(_session_start_cache) > 1:
+            os.environ.pop(OMNIGENT_SESSION_ID_ENV_VAR, None)
+            return
+        os.environ[OMNIGENT_SESSION_ID_ENV_VAR] = session_id
+
     async def _ensure_session_registered(session_id: str) -> None:
         if session_id in _session_start_cache:
             return
         snapshot = await _session_snapshot(session_id)
         _session_start_cache[session_id] = snapshot.created_at
         _session_workspace_cache[session_id] = snapshot.workspace
+        _publish_session_id(session_id)
 
     async def _resolve_session_spec_entry(session_id: str) -> _SpecEntry | None:
         if session_id in _session_spec_cache:
