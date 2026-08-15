@@ -16,6 +16,7 @@ Covers:
 from __future__ import annotations
 
 from omnigent.policies.builtins.safety import (
+    _GUARD_LATCH_ARMED_KEY,
     _GUARD_LATCH_KEY,
     _LOOP_STATE_KEY,
     _args_hash,
@@ -367,13 +368,56 @@ def test_latch_closes_on_trip() -> None:
 
 
 def test_latched_turn_denies_an_unrelated_tool() -> None:
-    """Once latched, a different tool on a different target is denied too."""
+    """Once armed, a different tool on a different target is denied too."""
     policy = detect_loop(window=10, threshold=3, action="DENY", latch=True)
-    state = {_GUARD_LATCH_KEY: "Loop guard: earlier trip."}
+    state = {_GUARD_LATCH_KEY: "Loop guard: earlier trip.", _GUARD_LATCH_ARMED_KEY: True}
 
     result = policy(tc("sys_os_read", {"path": "/some/other/file"}, state))
     assert result["result"] == "DENY"
     assert result["reason"] == "Loop guard: earlier trip."
+
+
+def test_latch_does_not_deny_the_batch_it_tripped_on() -> None:
+    """A model emits several calls from one response.
+
+    The calls after the one that tripped the guard were committed before any
+    result came back, so denying them punishes a decision it could not have
+    revised. They run; the next batch is refused.
+    """
+    policy = detect_loop(window=10, threshold=3, action="DENY", latch=True)
+    state = {_GUARD_LATCH_KEY: "Loop guard: earlier trip."}
+
+    assert (
+        policy(tc("sys_os_read", {"path": "/committed/before/the/trip"}, state))["result"]
+        == "ALLOW"
+    )
+
+
+def test_a_round_trip_arms_the_latch() -> None:
+    """``llm_request`` is where the model has demonstrably seen the denial."""
+    policy = detect_loop(window=10, threshold=3, action="DENY", latch=True)
+    state = {_GUARD_LATCH_KEY: "Loop guard: earlier trip."}
+
+    armed = policy({"type": "llm_request", "data": {}, "session_state": state})
+    assert {"key": _GUARD_LATCH_ARMED_KEY, "action": "set", "value": True} in armed[
+        "state_updates"
+    ]
+
+
+def test_a_round_trip_without_a_latch_arms_nothing() -> None:
+    policy = detect_loop(window=10, threshold=3, action="DENY", latch=True)
+    result = policy({"type": "llm_request", "data": {}, "session_state": {}})
+    assert result.get("state_updates", []) == []
+
+
+def test_trip_stores_the_latch_unarmed() -> None:
+    policy = detect_loop(window=10, threshold=3, action="DENY", latch=True)
+    h = _args_hash("sys_os_shell", {"command": "ls"})
+
+    result = policy(tc("sys_os_shell", {"command": "ls"}, _state_with_hashes([h, h])))
+    keys = {update["key"] for update in result["state_updates"]}
+    assert _GUARD_LATCH_KEY in keys
+    assert _GUARD_LATCH_ARMED_KEY not in keys
 
 
 def test_latch_releases_on_a_new_user_turn() -> None:

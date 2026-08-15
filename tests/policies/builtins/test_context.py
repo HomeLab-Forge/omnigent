@@ -8,6 +8,7 @@ import pytest
 
 from omnigent.policies.builtins.context import (
     _TASK_SWITCH_HISTORY_KEY,
+    _THRASHING_BATCH_KEY,
     _THRASHING_HISTORY_KEY,
     _looks_like_error,
     _strip_code_fences,
@@ -430,13 +431,10 @@ class TestDetectThrashingWindow:
             }
         )
 
-        assert result["state_updates"] == [
-            {
-                "key": _THRASHING_HISTORY_KEY,
-                "action": "set",
-                "value": [],
-            }
-        ]
+        updates = {update["key"]: update["value"] for update in result["state_updates"]}
+        assert updates[_THRASHING_HISTORY_KEY] == []
+        # A new instruction also drops any round-trip left open by the last one.
+        assert updates[_THRASHING_BATCH_KEY] is None
 
     def test_window_slides(self) -> None:
         policy = detect_thrashing(window=3, consecutive_threshold=3)

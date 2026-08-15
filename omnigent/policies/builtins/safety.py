@@ -483,7 +483,19 @@ def _args_hash(tool_name: str, arguments: object) -> str:
 # ``tool_call``. ``detect_thrashing`` fires on ``tool_result`` and can only set
 # the latch, so latching it without also enabling ``detect_loop`` sets a flag
 # nothing reads.
+#
+# The latch arms one round-trip after it closes. A model emits a whole batch of
+# tool calls from a single response, so the calls after the one that tripped the
+# guard were already committed before any result came back — denying them
+# punishes a decision the model had no chance to revise. Session d24accf4 shows
+# the shape: one assistant message at 12:34:42, then three fetches, the second
+# suppressed and the third denied, none of which it could have reconsidered.
+#
+# ``llm_request`` fires once per round-trip, so it is the point where the model
+# has demonstrably seen everything so far. Arming there means the batch in
+# flight finishes and the next one is refused.
 _GUARD_LATCH_KEY = "_policy_guard_latch"
+_GUARD_LATCH_ARMED_KEY = "_policy_guard_latch_armed"
 
 _GUARD_DO_NEXT = (
     "do_next: stop calling tools. Summarize what you have established so far, "
@@ -491,26 +503,39 @@ _GUARD_DO_NEXT = (
 )
 
 
-def _latched_reason(state: object) -> str:
-    """Read the latched guard reason, if a guard has tripped this turn.
+def _latched_reason(state: object, *, armed_only: bool = True) -> str:
+    """Read the latched guard reason.
 
     :param state: The event's ``session_state`` mapping.
+    :param armed_only: When true, a latch that has not yet survived a
+        round-trip reads as open, so the batch it tripped on finishes.
     :returns: The stored reason, or ``""`` when the latch is open.
     """
     if not isinstance(state, dict):
         return ""
     value = state.get(_GUARD_LATCH_KEY)
-    return value if isinstance(value, str) else ""
+    reason = value if isinstance(value, str) else ""
+    if reason and armed_only and not state.get(_GUARD_LATCH_ARMED_KEY):
+        return ""
+    return reason
 
 
 def _latch_update(reason: str) -> dict[str, object]:
-    """Build the state update that closes the latch for the rest of the turn."""
+    """Build the state update that closes the latch, unarmed."""
     return {"key": _GUARD_LATCH_KEY, "action": "set", "value": reason}
 
 
-def _latch_release() -> dict[str, object]:
-    """Build the state update that opens the latch on a new user turn."""
-    return {"key": _GUARD_LATCH_KEY, "action": "set", "value": ""}
+def _latch_arm() -> dict[str, object]:
+    """Build the state update that makes a closed latch start denying."""
+    return {"key": _GUARD_LATCH_ARMED_KEY, "action": "set", "value": True}
+
+
+def _latch_release() -> list[dict[str, object]]:
+    """Build the state updates that open the latch on a new user turn."""
+    return [
+        {"key": _GUARD_LATCH_KEY, "action": "set", "value": ""},
+        {"key": _GUARD_LATCH_ARMED_KEY, "action": "set", "value": False},
+    ]
 
 
 _URI_SCHEME_RE = _re.compile(r"^[a-z][a-z0-9+.-]*://")
@@ -640,9 +665,15 @@ def detect_loop(
                 "result": "ALLOW",
                 "state_updates": [
                     {"key": _LOOP_STATE_KEY, "action": "set", "value": []},
-                    *([_latch_release()] if latch else []),
+                    *(_latch_release() if latch else []),
                 ],
             }
+        # One round-trip has passed since the guard tripped, so the batch it
+        # tripped on has finished and the model has seen the denial.
+        if latch and event_type == "llm_request":
+            if _latched_reason(event.get("session_state"), armed_only=False):
+                return {"result": "ALLOW", "state_updates": [_latch_arm()]}
+            return _ALLOW
         if event_type != "tool_call":
             return _ALLOW
         data = event.get("data")
