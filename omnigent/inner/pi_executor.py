@@ -57,6 +57,7 @@ from omnigent.inner.native_attachments import parse_data_uri
 from omnigent.json_types import JsonObject as _JsonObject
 from omnigent.json_types import JsonValue
 from omnigent.llms._usage_observer import notify_from_dict as _notify_usage_from_dict
+from omnigent.llms.context_window import get_model_context_window
 from omnigent.model_metadata import ModelMetadata, ModelWireAPI
 from omnigent.onboarding.provider_config import CHAT_WIRE_API, RESPONSES_WIRE_API
 from omnigent.pi_model_compatibility import SYSTEM_AI_RESPONSES_KEYWORDS, unsupported_in_pi
@@ -1105,10 +1106,31 @@ def _pi_model_is_reasoning(model: str) -> bool:
 
 
 def _pi_model_json_entry(model: model_catalog.ModelEntry) -> _JsonObject:
-    """Translate normalized catalog metadata into Pi's model schema."""
+    """Translate normalized catalog metadata into Pi's model schema.
+
+    ``contextWindow`` is always sent. Omitting it leaves Pi on an internal
+    default sized for no model in particular, and for a gateway model the
+    catalog has no entry for that default is far below the real window.
+
+    That used to show up as Pi compacting early — measured at
+    ``token_count = 20684`` in session c5723032. Switching Pi's compaction off
+    (see :func:`_pi_settings_overlay`) removed that symptom without fixing the
+    cause, so the wrong window found its other outlet: session d636e884 reached
+    ~14.6k tokens and the model was then called without the user's query still
+    in the conversation, which Qwen's chat template rejects outright with
+    "No user query found in messages."
+
+    :func:`get_model_context_window` resolves the real number, honouring
+    ``AP_CONTEXT_WINDOW_OVERRIDE`` for exactly this case — a self-hosted model
+    no catalog describes. Sized correctly, Pi has no reason to intervene at
+    all, which is the point: one context boundary, owned by smart_compaction.
+    """
     entry: _JsonObject = {"id": model.id, "input": ["text", "image"]}
-    if model.metadata.context_window is not None:
-        entry["contextWindow"] = model.metadata.context_window
+    entry["contextWindow"] = (
+        model.metadata.context_window
+        if model.metadata.context_window is not None
+        else get_model_context_window(model.id)
+    )
     if model.metadata.max_output_tokens is not None:
         entry["maxTokens"] = model.metadata.max_output_tokens
     if _pi_model_is_reasoning(model.id):
