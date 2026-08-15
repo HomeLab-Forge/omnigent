@@ -82,6 +82,23 @@ PI_PRINTED_TOOL_EXHAUSTED_RESPONSE = (
     "Need from you: resend the request to start a clean turn."
 )
 
+# Progress note carried into the handover when a restart follows a turn Pi
+# abandoned after its tool calls, rather than one it compacted on purpose.
+PI_TOOL_TURN_WEDGED_SUMMARY = (
+    "The previous process stopped answering after its tool calls and was restarted. "
+    "The tool results it produced are recorded in the session; nothing after them is known."
+)
+
+# The turn's response when the restart above did not bring Pi back either. The
+# turn ends with a handoff so the session stays usable.
+PI_TOOL_TURN_WEDGED_RESPONSE = (
+    "Done: the tool calls recorded on this turn.\n"
+    "Intended next: continue from those results.\n"
+    "Stopped because: I stopped answering after my tool calls, and a restart did "
+    "not recover the turn.\n"
+    "Need from you: send the next message — the tool results are kept."
+)
+
 
 def shared_message_attribution_enabled() -> bool:
     """Return whether shared-message authors are visible to the model.
