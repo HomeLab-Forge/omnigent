@@ -680,7 +680,6 @@ class ExecutorAdapter(HarnessApp):
                                 reasoning=event.reasoning,
                                 error=event.error,
                             )
-                            _emit_context_tokens(event.usage)
                         elif isinstance(event, ToolCallRequest):
                             _end_llm_trace()
                             _active_tool_parent = tctx._current_span
@@ -725,6 +724,11 @@ class ExecutorAdapter(HarnessApp):
                                     response=event.response,
                                 )
                     # --- End tracing ---
+                    # Outside the tracing block: the context indicator is a UI
+                    # signal, not an observability one, so it must not depend on
+                    # whether tracing is on.
+                    if isinstance(event, LLMCallComplete):
+                        _emit_context_tokens(event.usage)
                     self._translate_event(event, ctx)
                     if (
                         self._terminal_tool_guard_ctx is ctx
