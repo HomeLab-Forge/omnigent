@@ -1128,6 +1128,27 @@ def _accumulate_session_usage(
     new_current = conversation_store.increment_session_usage(session_id, delta)
     # Per-user daily rollup (policy-gated; this is the per-turn delta).
     _record_daily_cost(conv, cost_delta, conversation_store)
+
+    # Persist how full the window is, the same label the native-harness route
+    # writes. The GET snapshot serves it as ``last_total_tokens``, and the web
+    # client seeds its context display from that on load — so without it a
+    # session shows "No usage data yet" on every open until a turn completes in
+    # that page, however many turns it has already run. Executor-backed
+    # harnesses (pi, claude-sdk, codex) never reached the native route, so the
+    # label was written for no session on this path.
+    #
+    # context_tokens is the last call's total — how full the window is going
+    # into the next request. total_tokens sums a tool-loop turn's calls and
+    # would read high; it is the fallback only because single-call turns make
+    # the two equal.
+    context_tokens = usage_obj.get("context_tokens")
+    if not isinstance(context_tokens, int) or context_tokens <= 0:
+        context_tokens = total_tokens if isinstance(total_tokens, int) else 0
+    if context_tokens > 0:
+        conversation_store.set_labels(
+            session_id,
+            {_LAST_CONTEXT_TOKENS_LABEL_KEY: str(context_tokens)},
+        )
     return _priced_cost_for_display(new_current)
 
 
