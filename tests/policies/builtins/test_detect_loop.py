@@ -18,6 +18,8 @@ from __future__ import annotations
 from omnigent.policies.builtins.safety import (
     _GUARD_LATCH_ARMED_KEY,
     _GUARD_LATCH_KEY,
+    _GUARD_STEER_PREFIX,
+    _GUARD_STOP_PREFIX,
     _LOOP_CORRECTION_KEY,
     _LOOP_STATE_KEY,
     _args_hash,
@@ -25,6 +27,7 @@ from omnigent.policies.builtins.safety import (
     _normalized_arguments,
     detect_loop,
 )
+from omnigent.runtime.harnesses._executor_adapter import _is_terminal_tool_guard_reason
 from tests.policies.builtins.helpers import tool_call_event as tc
 
 
@@ -454,6 +457,84 @@ def test_first_trip_corrects_and_clears_the_window() -> None:
     assert updates[_LOOP_STATE_KEY] == []
     assert updates[_LOOP_CORRECTION_KEY] == 1
     assert _GUARD_LATCH_KEY not in updates
+
+
+def test_a_steer_does_not_read_as_terminal_to_the_adapter() -> None:
+    """A steer must not end the turn it was issued to rescue.
+
+    The adapter has no view of a policy's intent — it matches the reason text
+    (``_is_terminal_tool_guard_reason``) and ends the turn behind a final
+    handoff. Both verdicts used to open with "Loop guard:", so every correction
+    was read as a stop and ``corrections_before_latch`` bought nothing. These
+    two assertions are the contract between the policy and the adapter; they
+    fail the moment either side's wording drifts back together.
+    """
+    policy = detect_loop(
+        window=10, threshold=3, action="DENY", latch=True, corrections_before_latch=1
+    )
+    h = _args_hash("sys_os_shell", {"command": "ls"})
+
+    steer = policy(tc("sys_os_shell", {"command": "ls"}, _state_with_hashes([h, h])))
+
+    assert steer["reason"].startswith(_GUARD_STEER_PREFIX)
+    assert _GUARD_STOP_PREFIX not in steer["reason"]
+    assert not _is_terminal_tool_guard_reason(steer["reason"])
+
+
+def test_a_stop_still_reads_as_terminal_to_the_adapter() -> None:
+    """Once the steer budget is spent the turn does end, as before."""
+    policy = detect_loop(
+        window=10, threshold=3, action="DENY", latch=True, corrections_before_latch=1
+    )
+    h = _args_hash("sys_os_shell", {"command": "ls"})
+    state = _state_with_hashes([h, h])
+    state[_LOOP_CORRECTION_KEY] = 1
+
+    stop = policy(tc("sys_os_shell", {"command": "ls"}, state))
+
+    assert stop["reason"].startswith(_GUARD_STOP_PREFIX)
+    assert _is_terminal_tool_guard_reason(stop["reason"])
+
+
+def test_no_guard_verdict_leaks_a_count_or_a_threshold() -> None:
+    """A verdict names the behaviour and never the arithmetic behind it.
+
+    Given "2 times in the last 12 calls", a model works the budget — how many
+    it has left, whether a different spelling resets the window — instead of
+    why the call did not work. Digits are the cheap, durable check: any count,
+    threshold, percentage or window size added later trips this.
+    """
+    steering = detect_loop(
+        window=12, threshold=2, action="DENY", latch=True, corrections_before_latch=1
+    )
+    h = _args_hash("sys_os_shell", {"command": "ls"})
+
+    steer = steering(tc("sys_os_shell", {"command": "ls"}, _state_with_hashes([h, h])))
+    stopped = _state_with_hashes([h, h])
+    stopped[_LOOP_CORRECTION_KEY] = 1
+    stop = steering(tc("sys_os_shell", {"command": "ls"}, stopped))
+
+    for verdict, label in ((steer, "steer"), (stop, "stop")):
+        assert not any(ch.isdigit() for ch in verdict["reason"]), (
+            f"the {label} verdict leaks a number to the agent: {verdict['reason']!r}"
+        )
+
+
+def test_a_steer_says_the_turn_continues() -> None:
+    """The steer has to tell the agent it still owns the turn.
+
+    Without that the model reads a denial as the end of the road and hands off
+    anyway, which is the behaviour the steer replaces.
+    """
+    policy = detect_loop(
+        window=10, threshold=3, action="DENY", latch=True, corrections_before_latch=1
+    )
+    h = _args_hash("oracle__fetch", {"ref": "x"})
+
+    reason = policy(tc("oracle__fetch", {"ref": "x"}, _state_with_hashes([h, h])))["reason"]
+
+    assert "the turn is still yours" in reason.lower()
+    assert "oracle__fetch" in reason
 
 
 def test_second_trip_latches() -> None:

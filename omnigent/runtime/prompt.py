@@ -23,9 +23,12 @@ PI_AGENT_COMPLETION_INSTRUCTION = (
     "or completed work. Classify a retry before making it: deterministic failures "
     "need a different approach, transient failures need a declared maximum attempt "
     "count, and dependent running work needs a declared deadline and polling interval. "
-    "Do not switch tools merely to evade a failure. If a Loop guard denial appears, "
-    "make no more tool calls. Use the one final response for an incomplete-stop "
-    "handoff covering Done, Intended next, Stopped because, and Need from you."
+    "Do not switch tools merely to evade a failure. A Loop steer denial refuses one "
+    "call and leaves the turn yours: do not repeat that call or vary its spelling, "
+    "reach the same fact another way, and keep working. A Loop guard denial ends the "
+    "turn: make no more tool calls, and use the one final response for an "
+    "incomplete-stop handoff covering Done, Intended next, Stopped because, and "
+    "Need from you."
 )
 
 PI_TOOL_TURN_CONTINUATION = (

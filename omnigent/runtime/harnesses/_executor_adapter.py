@@ -119,8 +119,18 @@ _OBSERVED_TOOL_CALL_STATUS = "in_progress"
 _MCP_TOOL_NAME_PREFIX = "mcp__"
 
 
+# A steer is not a stop. ``detect_loop`` denies one call, names what to do
+# instead, and the turn continues — see ``_GUARD_STEER_PREFIX`` in
+# omnigent/policies/builtins/safety.py. Checked first and on its own line
+# because this class of verdict exists to rescue a turn, and reading it as
+# terminal here would end the very turn it was issued for.
+_LOOP_STEER_PREFIX = "Loop steer:"
+
+
 def _is_terminal_tool_guard_reason(value: object) -> bool:
     if not isinstance(value, str):
+        return False
+    if _LOOP_STEER_PREFIX in value:
         return False
     return (
         "Loop guard:" in value
