@@ -2224,3 +2224,179 @@ async def test_policy_evaluator_no_active_turn_context_is_phase_aware() -> None:
         assert verdict.action == "POLICY_ACTION_ALLOW", advisory_phase
         assert verdict.reason is None, advisory_phase
 
+
+async def _drain_session_usage(
+    executor_factory: Any,
+    *,
+    conversation_id: str | None,
+) -> list[Any]:
+    """Run one turn and return the ``session.usage`` events it broadcast.
+
+    :param executor_factory: Zero-arg factory for the inner executor to drive.
+    :param conversation_id: Session id for the turn context, or ``None`` to
+        model a turn with no session bound.
+    :returns: The emitted :class:`SessionUsageEvent` objects, in order.
+    """
+    import asyncio
+
+    from omnigent.inner.tracing import disable_tracing
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+    from omnigent.runtime.harnesses._scaffold import TurnContext
+    from omnigent.server.schemas import CreateResponseRequest, SessionUsageEvent
+
+    # Tracing off is the point: the indicator is a UI signal, so it must not
+    # ride on whether spans are being exported.
+    disable_tracing()
+    adapter = ExecutorAdapter(executor_factory=executor_factory)
+    ctx = TurnContext(
+        response_id="resp_usage",
+        event_queue=asyncio.Queue(),
+        cancelled=asyncio.Event(),
+        conversation_id=conversation_id,
+    )
+    await adapter.run_turn(CreateResponseRequest(model="watchdog", input="inspect"), ctx)
+
+    emitted = []
+    while not ctx._event_queue.empty():
+        emitted.append(ctx._event_queue.get_nowait())
+    return [event for event in emitted if isinstance(event, SessionUsageEvent)]
+
+
+async def test_executor_adapter_emits_context_tokens_for_every_llm_call() -> None:
+    """Each LLM call broadcasts the window total, not just the end of the turn.
+
+    A turn drives the whole tool loop, so its terminal usage was the only thing
+    the client saw: the context indicator sat still for minutes and then jumped.
+    """
+    from omnigent.inner.executor import (
+        Executor,
+        ExecutorConfig,
+        ExecutorEvent,
+        LLMCallComplete,
+        Message,
+        ToolCallComplete,
+        ToolCallRequest,
+        ToolCallStatus,
+        ToolSpec,
+        TurnComplete,
+    )
+
+    class _ToolLoopExecutor(Executor):
+        async def run_turn(
+            self,
+            messages: list[Message],
+            tools: list[ToolSpec],
+            system_prompt: str,
+            config: ExecutorConfig | None = None,
+        ) -> AsyncIterator[ExecutorEvent]:
+            del messages, tools, system_prompt, config
+            yield LLMCallComplete(
+                model="openai/gpt-5.4-mini",
+                usage={"input_tokens": 100, "output_tokens": 20, "total_tokens": 120},
+            )
+            yield ToolCallRequest(
+                name="sys_os_read",
+                args={"path": "README.md"},
+                metadata={"call_id": "call_usage_1"},
+            )
+            yield ToolCallComplete(
+                name="sys_os_read",
+                status=ToolCallStatus.SUCCESS,
+                result="contents",
+                metadata={"call_id": "call_usage_1"},
+            )
+            yield LLMCallComplete(
+                model="openai/gpt-5.4-mini",
+                response="Done.",
+                usage={"input_tokens": 130, "output_tokens": 25, "total_tokens": 155},
+            )
+            yield TurnComplete(response="Done.")
+
+    events = await _drain_session_usage(_ToolLoopExecutor, conversation_id="conv_usage")
+
+    # One per call, each the last call's own total — summing across the loop
+    # would double-count the re-sent history and read far too full.
+    assert [event.context_tokens for event in events] == [120, 155]
+    assert {event.conversation_id for event in events} == {"conv_usage"}
+
+
+async def test_executor_adapter_context_tokens_prefers_the_window_over_the_call_total() -> None:
+    """``context_tokens`` is how full the window is; ``total_tokens`` is the fallback."""
+    from omnigent.inner.executor import (
+        Executor,
+        ExecutorConfig,
+        ExecutorEvent,
+        LLMCallComplete,
+        Message,
+        ToolSpec,
+        TurnComplete,
+    )
+
+    class _WindowUsageExecutor(Executor):
+        async def run_turn(
+            self,
+            messages: list[Message],
+            tools: list[ToolSpec],
+            system_prompt: str,
+            config: ExecutorConfig | None = None,
+        ) -> AsyncIterator[ExecutorEvent]:
+            del messages, tools, system_prompt, config
+            yield LLMCallComplete(
+                model="openai/gpt-5.4-mini",
+                response="Done.",
+                usage={"context_tokens": 4200, "total_tokens": 155},
+            )
+            yield TurnComplete(response="Done.")
+
+    events = await _drain_session_usage(_WindowUsageExecutor, conversation_id="conv_usage")
+    assert [event.context_tokens for event in events] == [4200]
+
+
+async def test_executor_adapter_skips_context_tokens_without_a_usable_total() -> None:
+    """A call with no usage, a zero total, or no bound session broadcasts nothing.
+
+    Zero would paint an empty ring over a session that has real history, and a
+    ``session.usage`` with no conversation id has nothing to update.
+    """
+    from omnigent.inner.executor import (
+        Executor,
+        ExecutorConfig,
+        ExecutorEvent,
+        LLMCallComplete,
+        Message,
+        ToolSpec,
+        TurnComplete,
+    )
+
+    class _ThinUsageExecutor(Executor):
+        async def run_turn(
+            self,
+            messages: list[Message],
+            tools: list[ToolSpec],
+            system_prompt: str,
+            config: ExecutorConfig | None = None,
+        ) -> AsyncIterator[ExecutorEvent]:
+            del messages, tools, system_prompt, config
+            yield LLMCallComplete(model="openai/gpt-5.4-mini")
+            yield LLMCallComplete(model="openai/gpt-5.4-mini", usage={"total_tokens": 0})
+            yield LLMCallComplete(model="openai/gpt-5.4-mini", usage={"output_tokens": 25})
+            yield TurnComplete(response="Done.")
+
+    assert await _drain_session_usage(_ThinUsageExecutor, conversation_id="conv_usage") == []
+
+    class _GoodUsageExecutor(Executor):
+        async def run_turn(
+            self,
+            messages: list[Message],
+            tools: list[ToolSpec],
+            system_prompt: str,
+            config: ExecutorConfig | None = None,
+        ) -> AsyncIterator[ExecutorEvent]:
+            del messages, tools, system_prompt, config
+            yield LLMCallComplete(
+                model="openai/gpt-5.4-mini",
+                usage={"total_tokens": 120},
+            )
+            yield TurnComplete(response="Done.")
+
+    assert await _drain_session_usage(_GoodUsageExecutor, conversation_id=None) == []
