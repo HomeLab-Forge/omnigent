@@ -18,6 +18,7 @@ from __future__ import annotations
 from omnigent.policies.builtins.safety import (
     _GUARD_LATCH_ARMED_KEY,
     _GUARD_LATCH_KEY,
+    _LOOP_CORRECTION_KEY,
     _LOOP_STATE_KEY,
     _args_hash,
     _normalize_uri,
@@ -435,3 +436,62 @@ def test_latch_off_by_default() -> None:
 
     result = policy(tc("sys_os_shell", {"command": "ls"}, _state_with_hashes([h, h])))
     assert all(u["key"] != _GUARD_LATCH_KEY for u in result["state_updates"])
+
+
+def test_first_trip_corrects_and_clears_the_window() -> None:
+    """With a correction budget the first detection routes, it does not stop."""
+    policy = detect_loop(
+        window=10, threshold=3, action="DENY", latch=True, corrections_before_latch=1
+    )
+    h = _args_hash("sys_os_shell", {"command": "ls"})
+
+    result = policy(tc("sys_os_shell", {"command": "ls"}, _state_with_hashes([h, h])))
+
+    assert result["result"] == "DENY"
+    assert "will keep failing" in result["reason"]
+    updates = {u["key"]: u["value"] for u in result["state_updates"]}
+    # Window cleared so a different approach is not flagged by these hashes.
+    assert updates[_LOOP_STATE_KEY] == []
+    assert updates[_LOOP_CORRECTION_KEY] == 1
+    assert _GUARD_LATCH_KEY not in updates
+
+
+def test_second_trip_latches() -> None:
+    """The correction budget is spent, so the next detection ends the turn."""
+    policy = detect_loop(
+        window=10, threshold=3, action="DENY", latch=True, corrections_before_latch=1
+    )
+    h = _args_hash("sys_os_shell", {"command": "ls"})
+    state = _state_with_hashes([h, h])
+    state[_LOOP_CORRECTION_KEY] = 1
+
+    result = policy(tc("sys_os_shell", {"command": "ls"}, state))
+
+    assert result["result"] == "DENY"
+    assert "ask the user one question" in result["reason"]
+    updates = {u["key"]: u["value"] for u in result["state_updates"]}
+    assert updates[_LOOP_STATE_KEY] != []
+    assert _GUARD_LATCH_KEY in updates
+
+
+def test_corrections_reset_on_a_new_user_turn() -> None:
+    """A fresh instruction restores the correction budget."""
+    policy = detect_loop(
+        window=10, threshold=3, action="DENY", latch=True, corrections_before_latch=1
+    )
+    event = {"type": "request", "data": {}, "session_state": {_LOOP_CORRECTION_KEY: 1}}
+
+    result = policy(event)
+
+    assert {"key": _LOOP_CORRECTION_KEY, "action": "set", "value": 0} in result["state_updates"]
+
+
+def test_no_correction_budget_latches_immediately() -> None:
+    """The default is unchanged: the first detection closes the latch."""
+    policy = detect_loop(window=10, threshold=3, action="DENY", latch=True)
+    h = _args_hash("sys_os_shell", {"command": "ls"})
+
+    result = policy(tc("sys_os_shell", {"command": "ls"}, _state_with_hashes([h, h])))
+
+    assert "ask the user one question" in result["reason"]
+    assert any(u["key"] == _GUARD_LATCH_KEY for u in result["state_updates"])
