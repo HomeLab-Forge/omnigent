@@ -3898,6 +3898,11 @@ export function buildSlashCommandWithArgsSet(
 /** Circumference of the progress ring (r=5.5). */
 const RING_CIRCUMFERENCE = 2 * Math.PI * 5.5;
 
+/** Text color for a context-usage fraction, shared by the ring and the panel. */
+function contextUsageColor(pct: number): string {
+  return pct > 0.8 ? "text-destructive" : pct > 0.6 ? "text-warning" : "text-muted-foreground";
+}
+
 /** Circular progress ring showing how much context window is used, with the used percentage beside it. */
 function ContextRing({ contextWindow, tokensUsed }: { contextWindow: number; tokensUsed: number }) {
   const pct = Math.min(tokensUsed / contextWindow, 1);
@@ -3906,8 +3911,7 @@ function ContextRing({ contextWindow, tokensUsed }: { contextWindow: number; tok
   const usedArc = pct * RING_CIRCUMFERENCE;
   const usedPct = Math.round(pct * 100);
 
-  const color =
-    pct > 0.8 ? "text-destructive" : pct > 0.6 ? "text-warning" : "text-muted-foreground";
+  const color = contextUsageColor(pct);
 
   return (
     <Tooltip>
@@ -3942,6 +3946,76 @@ function ContextRing({ contextWindow, tokensUsed }: { contextWindow: number; tok
         <p className="tabular-nums">{usedPct}% of context used.</p>
       </TooltipContent>
     </Tooltip>
+  );
+}
+
+/**
+ * Context-window readout above the composer, toggled by "/context".
+ *
+ * Reads the store directly so the numbers move as usage arrives during a
+ * turn, rather than freezing at whatever was known when the command ran.
+ */
+function ContextPanel({ onClose }: { onClose: () => void }) {
+  const contextWindow = useChatStore((s) => s.contextWindow);
+  const tokensUsed = useChatStore((s) => s.tokensUsed);
+  const llmModel = useChatStore((s) => s.llmModel);
+  const sessionModelOverride = useChatStore((s) => s.sessionModelOverride);
+  const itemCount = useChatStore((s) => s.blocks.length);
+
+  const model = sessionModelOverride ? `${sessionModelOverride} (override)` : llmModel;
+  // contextWindow > 0 keeps a zero window out of the division (0/0 → "NaN%").
+  const usage =
+    tokensUsed != null && contextWindow != null && contextWindow > 0
+      ? { used: tokensUsed, window: contextWindow, pct: Math.min(tokensUsed / contextWindow, 1) }
+      : null;
+
+  return (
+    <div
+      data-testid="composer-context-panel"
+      className="mx-4 mb-2 rounded-lg border border-border bg-muted/40 px-3 py-2 text-sm text-muted-foreground"
+    >
+      <div className="flex items-start justify-between gap-2">
+        <span className="min-w-0 truncate text-foreground" title={model ?? undefined}>
+          {model ?? "No model bound"}
+        </span>
+        <button
+          type="button"
+          onClick={onClose}
+          className="shrink-0 rounded-full hover:text-foreground"
+          aria-label="Close context usage"
+        >
+          <XIcon className="size-3.5" />
+        </button>
+      </div>
+      {usage ? (
+        <>
+          <p data-testid="composer-context-tokens" className="mt-1 tabular-nums">
+            {usage.used.toLocaleString()} / {usage.window.toLocaleString()} tokens (
+            {(usage.pct * 100).toFixed(1)}%)
+          </p>
+          <div className="mt-1.5 h-1 overflow-hidden rounded-full bg-muted">
+            <div
+              role="progressbar"
+              aria-label="Context used"
+              aria-valuenow={Math.round(usage.pct * 100)}
+              aria-valuemin={0}
+              aria-valuemax={100}
+              className={cn("h-full rounded-full bg-current", contextUsageColor(usage.pct))}
+              style={{ width: `${usage.pct * 100}%` }}
+            />
+          </div>
+        </>
+      ) : tokensUsed != null ? (
+        <p data-testid="composer-context-tokens" className="mt-1 tabular-nums">
+          {tokensUsed.toLocaleString()} tokens (context window size unknown)
+        </p>
+      ) : (
+        <p data-testid="composer-context-tokens" className="mt-1">
+          No usage data yet — send a message first.
+        </p>
+      )}
+      <p className="mt-1">Items in context: {itemCount}</p>
+    </div>
   );
 }
 
@@ -4245,6 +4319,9 @@ export function Composer({
   const [files, setFiles] = useState<File[]>([]);
   const [attachmentError, setAttachmentError] = useState<string | null>(null);
   const [commandError, setCommandError] = useState<string | null>(null);
+  // "/context" toggles the readout above the composer. Unlike commandError it
+  // survives keystrokes, so the panel stays up while the next message is typed.
+  const [contextPanelOpen, setContextPanelOpen] = useState(false);
   const [planModeBusy, setPlanModeBusy] = useState(false);
   // Index of the highlighted item in the slash-command suggestions menu.
   // -1 means no item highlighted (menu closed or no matches). When the menu
@@ -4664,29 +4741,11 @@ export function Composer({
         return true;
       }
       case "/context": {
-        const state = useChatStore.getState();
-        const { contextWindow, llmModel, sessionModelOverride, tokensUsed, blocks } = state;
-        const lines: string[] = [];
-        if (sessionModelOverride) lines.push(`Model: ${sessionModelOverride} (override)`);
-        else if (llmModel) lines.push(`Model: ${llmModel}`);
-        // contextWindow > 0 keeps a zero window out of the division (0/0 → "NaN%").
-        if (tokensUsed != null && contextWindow != null && contextWindow > 0) {
-          const pct = Math.min(tokensUsed / contextWindow, 1);
-          const filled = Math.round(pct * 20);
-          const bar = "█".repeat(filled) + "░".repeat(20 - filled);
-          const pctStr = (pct * 100).toFixed(1);
-          lines.push(
-            `${tokensUsed.toLocaleString()} / ${contextWindow.toLocaleString()} tokens (${pctStr}%)`,
-          );
-          lines.push(bar);
-        } else if (tokensUsed != null) {
-          lines.push(`${tokensUsed.toLocaleString()} tokens`);
-          lines.push("(Context window size unknown)");
-        } else {
-          lines.push("No usage data yet — send a message first.");
-        }
-        lines.push(`Items in context: ${blocks.length}`);
-        setCommandError(lines.join("\n"));
+        // Toggle the live panel; ContextPanel reads the numbers off the store.
+        dirtyRef.current = true;
+        setValue("");
+        setCommandError(null);
+        setContextPanelOpen((open) => !open);
         return true;
       }
       case "/help": {
@@ -4866,6 +4925,10 @@ export function Composer({
     }
 
     setCommandError(null);
+    // Sending is what dismisses the "/context" panel. This has to sit below the
+    // slash-command branch: "/context" returns through it, and a close batched
+    // with the toggle would read the pending `false` and flip it back open.
+    setContextPanelOpen(false);
     // Prepend all active reply quotes as Markdown blockquotes.
     const quotePreamble =
       replyQuotes.length > 0
@@ -5310,6 +5373,8 @@ export function Composer({
             ))}
           </div>
         )}
+        {/* Live context-window readout, toggled by "/context" */}
+        {contextPanelOpen && <ContextPanel onClose={() => setContextPanelOpen(false)} />}
         {/* Inline slash-command feedback: errors and /help output */}
         {commandError !== null && (
           <div className="px-4 pb-2 text-sm text-muted-foreground whitespace-pre-wrap">
