@@ -79,6 +79,7 @@ from omnigent.server.schemas import (
     ReasoningStartedEvent,
     ReasoningSummaryTextDeltaEvent,
     ReasoningTextDeltaEvent,
+    SessionUsageEvent,
     TraceContextEvent,
 )
 
@@ -462,6 +463,32 @@ class ExecutorAdapter(HarnessApp):
             [{"role": "user", "content": user_message}] if user_message else None
         )
 
+        def _emit_context_tokens(usage: dict[str, Any] | None) -> None:
+            """Broadcast how full the window is, per LLM call rather than per turn.
+
+            A turn drives the whole tool loop, so its terminal
+            ``response.completed`` is the only usage the client sees — the
+            indicator sits still for minutes while the loop grows the context,
+            then jumps. Native harnesses avoid that by posting
+            ``external_session_usage`` as they go; an executor had no equivalent.
+
+            ``context_tokens`` is the LAST call's total, so setting it per call
+            tracks the window. Summing ``total_tokens`` across a tool loop would
+            double-count the re-sent history and read far too full.
+            """
+            if not usage or ctx.conversation_id is None:
+                return
+            tokens = usage.get("context_tokens") or usage.get("total_tokens")
+            if not isinstance(tokens, int) or tokens <= 0:
+                return
+            ctx.emit(
+                SessionUsageEvent(
+                    type="session.usage",
+                    conversation_id=ctx.conversation_id,
+                    context_tokens=tokens,
+                )
+            )
+
         def _start_llm_trace(
             model: str | None = None,
             input_value: Any = None,
@@ -653,6 +680,7 @@ class ExecutorAdapter(HarnessApp):
                                 reasoning=event.reasoning,
                                 error=event.error,
                             )
+                            _emit_context_tokens(event.usage)
                         elif isinstance(event, ToolCallRequest):
                             _end_llm_trace()
                             _active_tool_parent = tctx._current_span

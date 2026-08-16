@@ -2223,3 +2223,4 @@ async def test_policy_evaluator_no_active_turn_context_is_phase_aware() -> None:
         verdict = await adapter._stable_policy_evaluator(advisory_phase, {})
         assert verdict.action == "POLICY_ACTION_ALLOW", advisory_phase
         assert verdict.reason is None, advisory_phase
+
