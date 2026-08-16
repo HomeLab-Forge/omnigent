@@ -497,18 +497,32 @@ def _args_hash(tool_name: str, arguments: object) -> str:
 _GUARD_LATCH_KEY = "_policy_guard_latch"
 _GUARD_LATCH_ARMED_KEY = "_policy_guard_latch_armed"
 
+#: Opens a STOP. The executor adapter matches this prefix to end the turn
+#: behind a final handoff (``_is_terminal_tool_guard_reason``), so it belongs
+#: only on a verdict that really is the end of the road.
+_GUARD_STOP_PREFIX = "Loop guard:"
+
+#: Opens a STEER: one call denied, the turn carries on. It must NOT contain the
+#: stop prefix. Both verdicts used to open with "Loop guard:", and the adapter
+#: cannot see a policy's intent — only that string — so every correction ended
+#: the turn it was issued to rescue, and ``corrections_before_latch`` bought
+#: nothing.
+_GUARD_STEER_PREFIX = "Loop steer:"
+
 _GUARD_DO_NEXT = (
     "do_next: stop calling tools. Summarize what you have established so far, "
     "list what is blocking you, and ask the user one question."
 )
 
-#: Said on a correction rather than a stop. The repeat is evidence the call
-#: itself is wrong, not that the task is finished — a guard that only ever ends
-#: the turn makes the human the recovery mechanism.
+#: Said on a steer rather than a stop. The repeat is evidence the call itself is
+#: wrong, not that the task is finished — a guard that only ever ends the turn
+#: makes the human the recovery mechanism.
 _GUARD_DO_DIFFERENTLY = (
-    "do_next: this exact call will keep failing. Do not repeat it and do not "
-    "vary its spelling. Read the last error, then either reach the same fact a "
-    "different way or state what is blocking you."
+    "do_next: the turn is still yours — this denied one call, not the turn. "
+    "This exact call will keep failing and rephrasing its arguments will not "
+    "change that. Name in one line what you were trying to establish, then "
+    "reach that fact another way. If there is no other way, say what is "
+    "blocking you and stop calling tools."
 )
 #: Corrections issued this turn, so the second detection can stop instead of
 #: correcting again.
@@ -744,9 +758,9 @@ def detect_loop(
             issued = corrections if isinstance(corrections, int) else 0
             correcting = issued < corrections_before_latch
             reason = (
-                f"Loop guard: tool '{tool_name}' was called with {repeated} "
-                f"{count} times in the last {len(recent)} calls. Rephrasing the "
-                "arguments will not change the result. "
+                f"{_GUARD_STEER_PREFIX if correcting else _GUARD_STOP_PREFIX} "
+                f"tool '{tool_name}' was called with {repeated} "
+                f"{count} times in the last {len(recent)} calls. "
                 f"{_GUARD_DO_DIFFERENTLY if correcting else _GUARD_DO_NEXT}"
             )
             return {
