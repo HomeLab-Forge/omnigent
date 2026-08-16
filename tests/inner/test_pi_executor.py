@@ -5620,6 +5620,63 @@ def test_pi_requests_recovery_after_a_failed_tool() -> None:
     _run(_test())
 
 
+def _init_repo(root: Path, tracked: str = "file.txt") -> None:
+    """Create a committed git repository at *root*."""
+    root.mkdir(parents=True, exist_ok=True)
+    run = lambda *args: subprocess.run(  # noqa: E731
+        ["git", *args], cwd=root, check=True, capture_output=True
+    )
+    run("init", "-q")
+    run("config", "user.email", "t@example.com")
+    run("config", "user.name", "t")
+    run("config", "commit.gpgsign", "false")
+    (root / tracked).write_text("one\n", encoding="utf-8")
+    run("add", tracked)
+    run("commit", "-qm", "init")
+
+
+def test_repository_state_finds_the_checkout_below_a_workspace() -> None:
+    """A workspace of checkouts reports the one holding uncommitted work."""
+    with tempfile.TemporaryDirectory() as tmp:
+        workspace = Path(tmp)
+        _init_repo(workspace / "Org" / "clean")
+        _init_repo(workspace / "Org" / "dirty")
+        (workspace / "Org" / "dirty" / "file.txt").write_text("two\n", encoding="utf-8")
+
+        state = pi_executor._capture_repository_state(str(workspace))
+
+        assert state is not None
+        assert state.modified_paths == ["file.txt"]
+        assert state.workspace is not None
+        assert state.workspace.replace("\\", "/").endswith("Org/dirty")
+
+
+def test_repository_state_keeps_the_workspace_when_nothing_is_dirty() -> None:
+    """A workspace whose checkouts are all clean still reports the workspace."""
+    with tempfile.TemporaryDirectory() as tmp:
+        workspace = Path(tmp)
+        _init_repo(workspace / "Org" / "clean")
+
+        state = pi_executor._capture_repository_state(str(workspace))
+
+        assert state is not None
+        assert state.modified_paths == []
+        assert state.untracked_paths == []
+
+
+def test_repository_state_prefers_the_checkout_the_cwd_is_inside() -> None:
+    """A cwd that is itself a repository is used directly, not scanned for."""
+    with tempfile.TemporaryDirectory() as tmp:
+        repo = Path(tmp) / "repo"
+        _init_repo(repo)
+        (repo / "file.txt").write_text("changed\n", encoding="utf-8")
+
+        state = pi_executor._capture_repository_state(str(repo))
+
+        assert state is not None
+        assert state.modified_paths == ["file.txt"]
+
+
 def _silent_post_tool_rpc_lines() -> list[str]:
     """Pi acknowledging each continuation and ending the turn with no text."""
     return [
