@@ -515,9 +515,11 @@ def detect_thrashing(
         if consecutive_threshold > 0 and len(updated) >= consecutive_threshold:
             tail = updated[-consecutive_threshold:]
             if all(v == 1 for v in tail):
+                # No count, no threshold — see the note above _GUARD_STOP_PREFIX
+                # in policies/builtins/safety.py.
                 reason = (
-                    f"Loop guard: the agent produced {consecutive_threshold} "
-                    f"consecutive tool errors. {_GUARD_DO_NEXT}"
+                    "Loop guard: the agent's tool calls are failing one after "
+                    f"another. {_GUARD_DO_NEXT}"
                 )
                 return {
                     "result": normalised_action,
@@ -533,10 +535,9 @@ def detect_thrashing(
             rate_window = updated[-effective_window:]
             rate = sum(rate_window) / len(rate_window)
             if rate >= window_error_rate:
-                pct = int(rate * 100)
                 reason = (
-                    f"Loop guard: tool results had a {pct}% error rate over "
-                    f"the last {effective_window} calls. {_GUARD_DO_NEXT}"
+                    "Loop guard: the agent's recent tool calls have been "
+                    f"failing repeatedly. {_GUARD_DO_NEXT}"
                 )
                 return {
                     "result": normalised_action,

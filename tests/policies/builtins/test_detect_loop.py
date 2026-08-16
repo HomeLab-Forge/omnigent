@@ -496,6 +496,30 @@ def test_a_stop_still_reads_as_terminal_to_the_adapter() -> None:
     assert _is_terminal_tool_guard_reason(stop["reason"])
 
 
+def test_no_guard_verdict_leaks_a_count_or_a_threshold() -> None:
+    """A verdict names the behaviour and never the arithmetic behind it.
+
+    Given "2 times in the last 12 calls", a model works the budget — how many
+    it has left, whether a different spelling resets the window — instead of
+    why the call did not work. Digits are the cheap, durable check: any count,
+    threshold, percentage or window size added later trips this.
+    """
+    steering = detect_loop(
+        window=12, threshold=2, action="DENY", latch=True, corrections_before_latch=1
+    )
+    h = _args_hash("sys_os_shell", {"command": "ls"})
+
+    steer = steering(tc("sys_os_shell", {"command": "ls"}, _state_with_hashes([h, h])))
+    stopped = _state_with_hashes([h, h])
+    stopped[_LOOP_CORRECTION_KEY] = 1
+    stop = steering(tc("sys_os_shell", {"command": "ls"}, stopped))
+
+    for verdict, label in ((steer, "steer"), (stop, "stop")):
+        assert not any(ch.isdigit() for ch in verdict["reason"]), (
+            f"the {label} verdict leaks a number to the agent: {verdict['reason']!r}"
+        )
+
+
 def test_a_steer_says_the_turn_continues() -> None:
     """The steer has to tell the agent it still owns the turn.
 

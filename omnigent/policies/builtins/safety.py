@@ -497,6 +497,13 @@ def _args_hash(tool_name: str, arguments: object) -> str:
 _GUARD_LATCH_KEY = "_policy_guard_latch"
 _GUARD_LATCH_ARMED_KEY = "_policy_guard_latch_armed"
 
+#: A guard verdict names the behaviour, never the count or the threshold behind
+#: it. Told "2 times in the last 12 calls", a model starts working the budget —
+#: how many it has left, whether a different spelling resets the window —
+#: instead of why the call did not work. The repetition is the signal it needs;
+#: the arithmetic is ours. Applies to every reason built here and in
+#: ``policies/builtins/context.py``.
+#:
 #: Opens a STOP. The executor adapter matches this prefix to end the turn
 #: behind a final handoff (``_is_terminal_tool_guard_reason``), so it belongs
 #: only on a verdict that really is the end of the road.
@@ -752,15 +759,17 @@ def detect_loop(
         count = recent.count(h)
         if count >= threshold:
             repeated = (
-                "the same target" if (ignore_keys or normalize_uri_args) else "identical arguments"
+                "against the same target"
+                if (ignore_keys or normalize_uri_args)
+                else "with identical arguments"
             )
             corrections = state.get(_LOOP_CORRECTION_KEY)
             issued = corrections if isinstance(corrections, int) else 0
             correcting = issued < corrections_before_latch
             reason = (
                 f"{_GUARD_STEER_PREFIX if correcting else _GUARD_STOP_PREFIX} "
-                f"tool '{tool_name}' was called with {repeated} "
-                f"{count} times in the last {len(recent)} calls. "
+                f"tool '{tool_name}' has already been called {repeated} in this "
+                "turn and it did not advance anything. "
                 f"{_GUARD_DO_DIFFERENTLY if correcting else _GUARD_DO_NEXT}"
             )
             return {
