@@ -101,6 +101,11 @@ class ExecutorEvent:
 
 
 @dataclass
+class ExecutorProgress(ExecutorEvent):
+    """Internal progress signal with no user-facing payload."""
+
+
+@dataclass
 class TextChunk(ExecutorEvent):
     """Streaming text output.
 
@@ -130,6 +135,43 @@ class ReasoningChunk(ExecutorEvent):
 
     delta: str
     event_type: str
+
+
+@dataclass
+class LLMCallStarted(ExecutorEvent):
+    """An executor started one provider model call.
+
+    Executors that run their own tool loop may make several model calls during
+    one Omnigent turn. Emitting this boundary lets tracing keep each call
+    separate from the tools between them.
+
+    :param model: Provider model identifier for this call, or ``None`` when the
+        executor cannot resolve it.
+    :param input: New user or tool-result messages that triggered this call.
+        Executors may omit it when the provider does not expose call boundaries.
+    """
+
+    model: str | None = None
+    input: list[Message] | None = None
+
+
+@dataclass
+class LLMCallComplete(ExecutorEvent):
+    """One provider model call finished.
+
+    :param model: Provider model identifier for this call.
+    :param usage: Provider-reported usage for this call, using the same
+        exclusive token buckets as :class:`TurnComplete`.
+    :param response: Assistant text produced by this call, when available.
+    :param reasoning: Reasoning text produced by this call, when available.
+    :param error: Provider error for this call, or ``None`` on success.
+    """
+
+    model: str | None = None
+    usage: ExecutorUsage | None = None
+    response: str | None = None
+    reasoning: str | None = None
+    error: str | None = None
 
 
 @dataclass
@@ -227,12 +269,18 @@ class CompactionComplete(ExecutorEvent):
         session replays these instead of the full original history.
         ``None`` when the harness cannot export its compacted state
         (e.g. claude-sdk where compaction is internal to the CLI).
+    :param handover: Validated structured handover state when compaction
+        reset an active harness context. ``None`` for generic compaction.
+    :param handover_loaded: Whether the harness started its fresh context
+        from ``handover`` before emitting this event.
     """
 
     summary: str
     token_count: int
     model: str | None = None
     compacted_messages: CompactedMessages | None = None
+    handover: ExecutorExtra | None = None
+    handover_loaded: bool = False
 
 
 @dataclass

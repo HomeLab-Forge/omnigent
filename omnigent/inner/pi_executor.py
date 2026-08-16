@@ -43,9 +43,11 @@ import secrets
 import shutil
 import subprocess
 import tempfile
+import time
 from asyncio import Queue, Task
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
+from datetime import UTC, datetime
 from typing import Any, NotRequired, TypeAlias, TypedDict, cast
 from urllib.parse import urlparse as _urlparse
 
@@ -55,6 +57,7 @@ from omnigent.inner.native_attachments import parse_data_uri
 from omnigent.json_types import JsonObject as _JsonObject
 from omnigent.json_types import JsonValue
 from omnigent.llms._usage_observer import notify_from_dict as _notify_usage_from_dict
+from omnigent.llms.context_window import get_model_context_window
 from omnigent.model_metadata import ModelMetadata, ModelWireAPI
 from omnigent.onboarding.provider_config import CHAT_WIRE_API, RESPONSES_WIRE_API
 from omnigent.pi_model_compatibility import SYSTEM_AI_RESPONSES_KEYWORDS, unsupported_in_pi
@@ -63,6 +66,22 @@ from omnigent.pi_native_credentials import (
     _is_databricks_ai_gateway_url,
 )
 from omnigent.runner.identity import OMNIGENT_SESSION_ENV_VAR
+from omnigent.runtime.prompt import (
+    PI_AGENT_COMPLETION_INSTRUCTION,
+    PI_PRINTED_TOOL_EXHAUSTED_RESPONSE,
+    PI_PRINTED_TOOL_RECOVERY,
+    PI_PRINTED_TOOL_RECOVERY_WITH_SCHEMA,
+    PI_TOOL_TURN_CONTINUATION,
+    PI_TOOL_TURN_WEDGED_RESPONSE,
+    PI_TOOL_TURN_WEDGED_SUMMARY,
+    append_framework_instructions,
+)
+from omnigent.runtime.session_checkpoint import (
+    CheckpointPhase,
+    RepositoryState,
+    SemanticHandoverDraft,
+    SessionHandover,
+)
 from omnigent.spec.types import RetryPolicy
 
 from ._subprocess_lifecycle import close_subprocess_transport
@@ -70,10 +89,14 @@ from .async_utils import run_sync_on_thread
 from .databricks_executor import _read_databrickscfg
 from .datamodel import OSEnvSandboxSpec, OSEnvSpec
 from .executor import (
+    CompactionComplete,
     Executor,
     ExecutorConfig,
     ExecutorError,
     ExecutorEvent,
+    ExecutorProgress,
+    LLMCallComplete,
+    LLMCallStarted,
     Message,
     ReasoningChunk,
     TextChunk,
@@ -85,6 +108,22 @@ from .executor import (
 )
 
 logger = logging.getLogger(__name__)
+
+_TOOL_TURN_MAX_CONTINUATIONS = 2
+# Restarts allowed per turn when Pi stops answering after its tool calls. The
+# restart drops the transcript that wedged it, so a second silence is no longer
+# a context problem and another restart would only replay the turn.
+_TOOL_TURN_MAX_WEDGE_RESTARTS = 1
+_TOOL_EXECUTION_MAX_SECONDS = 600.0
+_POST_TOOL_EVENT_IDLE_TIMEOUT_SECONDS = 70.0
+_PRINTED_TOOL_INTENT_MAX_CHARS = 4096
+# A model that prints instead of calling often keeps printing on a bare nudge,
+# so the second attempt restates the tool's argument names before we give up.
+_PRINTED_TOOL_MAX_RECOVERIES = 2
+# How much of an assistant message to hold before streaming it. A printed
+# invocation is recognisable from its opening characters, and this is small
+# enough that the pause is invisible next to the model's own decode rate.
+_PRINTED_TOOL_GATE_CHARS = 160
 
 # Each line of Pi's JSONL output; the event schema is owned by the Pi CLI
 # not us, and varies across subcommands (response ack, message_update,
@@ -155,6 +194,31 @@ class _PiMessageUsage(TypedDict):
 
 class _PiTurnUsage(_PiMessageUsage):
     context_tokens: int
+
+
+@dataclass(frozen=True)
+class SmartCompactionConfig:
+    """Configured structured rollover for long Pi agent loops."""
+
+    enabled: bool = False
+    trigger_tokens: int = 0
+    handover_max_tokens: int = 4096
+    source_max_chars: int = 320_000
+    timeout_seconds: float = 300.0
+    poll_interval_seconds: float = 15.0
+    instructions: str = ""
+
+    def __post_init__(self) -> None:
+        if self.enabled and self.trigger_tokens <= 0:
+            raise ValueError("smart compaction trigger_tokens must be positive")
+        if self.handover_max_tokens < 512:
+            raise ValueError("smart compaction handover_max_tokens must be at least 512")
+        if self.source_max_chars < 16_384:
+            raise ValueError("smart compaction source_max_chars must be at least 16384")
+        if self.timeout_seconds <= 0:
+            raise ValueError("smart compaction timeout_seconds must be positive")
+        if self.poll_interval_seconds <= 0:
+            raise ValueError("smart compaction poll_interval_seconds must be positive")
 
 
 # ---------------------------------------------------------------------------
@@ -568,6 +632,187 @@ module.exports = function(pi) {{
 """
 
 
+def _pi_settings_overlay(
+    retry_settings: Mapping[str, object],
+    smart_compaction: SmartCompactionConfig,
+) -> dict[str, object]:
+    """Build the settings block Omnigent merges into Pi's ``settings.json``.
+
+    Carries the retry budget, plus a compaction kill-switch when Omnigent is
+    running its own context rollover.
+
+    Pi auto-compacts whenever ``contextTokens > contextWindow - reserveTokens``
+    (``compaction.ts``), with ``reserveTokens`` defaulting to 16384 and
+    ``compaction.enabled`` defaulting to True. For a gateway model Pi has no
+    catalog entry for, its ``contextWindow`` is far below the real one, so it
+    fires early and often: measured in session c5723032, Pi compacted at
+    ``token_count = 20684`` against a smart_compaction ``trigger_tokens`` of
+    56000.
+
+    That is why the structured handover has never once run. Pi's own auto
+    compaction carries no ``customInstructions``, so the handover extension
+    returns at its first gate, Pi writes a prose summary instead, and Omnigent
+    falls back to the generic branch — every rollover, in every session. Two
+    compaction systems were racing and the one without the schema always won.
+
+    So when smart_compaction owns the rollover, Pi's is switched off. There is
+    exactly one context boundary after this, at ``trigger_tokens``, and it
+    carries the request the extension is waiting for.
+
+    :param retry_settings: ``RetryPolicy.pi.settings()`` output.
+    :param smart_compaction: The executor's smart-compaction config.
+    :returns: A settings mapping to merge into Pi's ``settings.json``.
+    """
+    overlay: dict[str, object] = dict(retry_settings)
+    if smart_compaction.enabled:
+        overlay["compaction"] = {"enabled": False}
+    return overlay
+
+
+def _generate_handover_extension_js(config: SmartCompactionConfig) -> str:
+    """Generate the tools-disabled structured handover extension."""
+    settings_json = json.dumps(
+        {
+            "handoverMaxTokens": config.handover_max_tokens,
+            "sourceMaxChars": config.source_max_chars,
+        },
+        indent=2,
+    )
+    return f"""\
+// Auto-generated Omnigent context handover extension for Pi.
+const SETTINGS = {settings_json};
+const REQUEST_PREFIX = "OMNIGENT_STRUCTURED_HANDOVER_V1\\n";
+const FIRST_KEPT_SENTINEL = "__omnigent_handover_v1__";
+
+// Every failure path here used to `return` silently, so a fallback handover was
+// indistinguishable from one that never ran. stderr is the runner log.
+function bail(why) {{
+  try {{ console.error("[omnigent-handover] giving up: " + why); }} catch (_e) {{}}
+}}
+
+function renderEntry(entry) {{
+  if (!entry || typeof entry !== "object") return "";
+  if (entry.type === "message" && entry.message) {{
+    return JSON.stringify(entry.message);
+  }}
+  if (entry.type === "compaction" && typeof entry.summary === "string") {{
+    return JSON.stringify({{ role: "compactionSummary", summary: entry.summary }});
+  }}
+  if (entry.type === "custom_message") {{
+    return JSON.stringify({{
+      role: "custom",
+      customType: entry.customType,
+      content: entry.content
+    }});
+  }}
+  return "";
+}}
+
+function boundedTranscript(entries) {{
+  const full = entries.map(renderEntry).filter(Boolean).join("\\n");
+  if (full.length <= SETTINGS.sourceMaxChars) return full;
+  const headChars = Math.min(48000, Math.floor(SETTINGS.sourceMaxChars / 4));
+  const tailChars = SETTINGS.sourceMaxChars - headChars;
+  return full.slice(0, headChars)
+    + "\\n[older context omitted at the handover boundary]\\n"
+    + full.slice(-tailChars);
+}}
+
+function extractJson(text) {{
+  const trimmed = String(text || "").trim();
+  const start = trimmed.indexOf("{{");
+  const end = trimmed.lastIndexOf("}}");
+  if (start < 0 || end <= start) throw new Error("handover response did not contain JSON");
+  return JSON.parse(trimmed.slice(start, end + 1));
+}}
+
+module.exports = function(pi) {{
+  pi.on("session_before_compact", async (event, ctx) => {{
+    const instructions = event && event.customInstructions;
+    if (typeof instructions !== "string" || !instructions.startsWith(REQUEST_PREFIX)) return;
+    if (!ctx.model) {{ bail("no model on the compaction context"); return; }}
+
+    let request;
+    try {{
+      request = JSON.parse(instructions.slice(REQUEST_PREFIX.length));
+    }} catch (error) {{
+      bail("request payload did not parse: " + error);
+      return;
+    }}
+
+    const transcript = boundedTranscript(event.branchEntries || []);
+    let response;
+    try {{
+      const completionOptions = {{
+        signal: event.signal,
+        cacheRetention: "none"
+      }};
+      completionOptions["max" + "Tokens"] = SETTINGS.handoverMaxTokens;
+      response = await ctx.modelRegistry.complete(
+        ctx.model,
+        {{
+          systemPrompt: [
+            "Create a task handover for a fresh context.",
+            "Return one JSON object that matches the supplied schema.",
+            "Describe goals and outcomes, not a transcript of calls.",
+            "Separate verified facts from theories. Preserve failures, retry conditions,",
+            "remaining work, the exact next action, blockers, active waits, and loaded skills.",
+            "Do not use markdown fences or add text outside the JSON object."
+          ].join(" "),
+          messages: [{{
+            role: "user",
+            content: [{{
+              type: "text",
+              text: REQUEST_PREFIX + JSON.stringify(request) + "\\n\\n<conversation>\\n"
+                + transcript + "\\n</conversation>"
+            }}],
+            timestamp: Date.now()
+          }}]
+        }},
+        completionOptions
+      );
+    }} catch (error) {{
+      bail("handover completion failed: " + error);
+      return;
+    }}
+
+    const text = (response.content || [])
+      .filter((part) => part && part.type === "text" && typeof part.text === "string")
+      .map((part) => part.text)
+      .join("\\n");
+
+    let draft;
+    try {{
+      draft = extractJson(text);
+    }} catch (error) {{
+      bail("model did not return JSON (" + text.length + " chars): " + error);
+      return;
+    }}
+    if (!draft || typeof draft !== "object") {{
+      bail("parsed handover was not an object");
+      return;
+    }}
+    draft.original_directive = request.original_directive;
+
+    const summary = "Structured session handover:\\n" + JSON.stringify(draft, null, 2);
+    return {{
+      compaction: {{
+        summary,
+        firstKeptEntryId: FIRST_KEPT_SENTINEL,
+        tokensBefore: event.preparation.tokensBefore,
+        usage: response.usage,
+        details: {{
+          type: "omnigent_session_handover",
+          version: 1,
+          draft
+        }}
+      }}
+    }};
+  }});
+}};
+"""
+
+
 # ---------------------------------------------------------------------------
 # Credential helpers (shared pattern with codex_executor / claude_sdk_executor)
 # ---------------------------------------------------------------------------
@@ -867,10 +1112,31 @@ def _pi_model_is_reasoning(model: str) -> bool:
 
 
 def _pi_model_json_entry(model: model_catalog.ModelEntry) -> _JsonObject:
-    """Translate normalized catalog metadata into Pi's model schema."""
+    """Translate normalized catalog metadata into Pi's model schema.
+
+    ``contextWindow`` is always sent. Omitting it leaves Pi on an internal
+    default sized for no model in particular, and for a gateway model the
+    catalog has no entry for that default is far below the real window.
+
+    That used to show up as Pi compacting early — measured at
+    ``token_count = 20684`` in session c5723032. Switching Pi's compaction off
+    (see :func:`_pi_settings_overlay`) removed that symptom without fixing the
+    cause, so the wrong window found its other outlet: session d636e884 reached
+    ~14.6k tokens and the model was then called without the user's query still
+    in the conversation, which Qwen's chat template rejects outright with
+    "No user query found in messages."
+
+    :func:`get_model_context_window` resolves the real number, honouring
+    ``AP_CONTEXT_WINDOW_OVERRIDE`` for exactly this case — a self-hosted model
+    no catalog describes. Sized correctly, Pi has no reason to intervene at
+    all, which is the point: one context boundary, owned by smart_compaction.
+    """
     entry: _JsonObject = {"id": model.id, "input": ["text", "image"]}
-    if model.metadata.context_window is not None:
-        entry["contextWindow"] = model.metadata.context_window
+    entry["contextWindow"] = (
+        model.metadata.context_window
+        if model.metadata.context_window is not None
+        else get_model_context_window(model.id)
+    )
     if model.metadata.max_output_tokens is not None:
         entry["maxTokens"] = model.metadata.max_output_tokens
     if _pi_model_is_reasoning(model.id):
@@ -1065,6 +1331,7 @@ class _PiRpcSession:
     _line_queue: Queue[str | None] = field(default_factory=Queue)
     _stderr_lines: list[str] = field(default_factory=list)
     _tmp_dir: str | None = None
+    _last_read_timed_out: bool = False
 
     async def start(
         self,
@@ -1191,8 +1458,11 @@ class _PiRpcSession:
     async def read_line(self, timeout: float = 120.0) -> str | None:
         """Read the next JSONL line from Pi's stdout. Returns None on EOF."""
         try:
-            return await asyncio.wait_for(self._line_queue.get(), timeout=timeout)
+            line = await asyncio.wait_for(self._line_queue.get(), timeout=timeout)
+            self._last_read_timed_out = False
+            return line
         except asyncio.TimeoutError:
+            self._last_read_timed_out = True
             return None
 
     async def close(self) -> None:
@@ -1613,6 +1883,131 @@ def _extract_pi_turn_usage(
     }
 
 
+def _pi_message_model(message: object, fallback_model: str | None) -> str | None:
+    """Return the resolved model recorded on a Pi assistant message."""
+    if not isinstance(message, dict):
+        return fallback_model
+    raw_model = message.get("model")
+    return raw_model if isinstance(raw_model, str) and raw_model else fallback_model
+
+
+def _pi_trace_input_message(message: object) -> Message | None:
+    """Keep the new non-assistant message that triggered a Pi model call."""
+    if not isinstance(message, dict):
+        return None
+    role = message.get("role")
+    if not isinstance(role, str) or role == "assistant":
+        return None
+    traced: Message = {"role": role}
+    for key in ("content", "toolCallId", "toolName", "isError"):
+        if key in message:
+            traced[key] = message[key]
+    return traced
+
+
+def _extract_pi_message_output(message: object) -> tuple[str | None, str | None]:
+    """Extract assistant text and reasoning from a completed Pi message."""
+    if not isinstance(message, dict) or message.get("role") != "assistant":
+        return None, None
+    content = message.get("content")
+    if isinstance(content, str):
+        return content or None, None
+    if not isinstance(content, list):
+        return None, None
+
+    text_parts: list[str] = []
+    reasoning_parts: list[str] = []
+    for part in content:
+        if not isinstance(part, dict):
+            continue
+        part_type = part.get("type")
+        if part_type == "text":
+            value = part.get("text")
+            if isinstance(value, str) and value:
+                text_parts.append(value)
+        elif part_type in {"thinking", "reasoning"}:
+            value = part.get("thinking")
+            if not isinstance(value, str):
+                value = part.get("text")
+            if isinstance(value, str) and value:
+                reasoning_parts.append(value)
+    return "".join(text_parts) or None, "".join(reasoning_parts) or None
+
+
+def _pi_message_has_tool_call(message: object) -> bool:
+    """Return whether a completed Pi assistant message requested a tool."""
+    if not isinstance(message, dict):
+        return False
+    content = message.get("content")
+    return isinstance(content, list) and any(
+        isinstance(part, dict) and part.get("type") == "toolCall" for part in content
+    )
+
+
+def _printed_tool_target(text: str, tool_names: Sequence[str]) -> str | None:
+    """Return the registered tool a short printed invocation intended to call."""
+    candidate = text.strip()
+    if not candidate or len(candidate) > _PRINTED_TOOL_INTENT_MAX_CHARS:
+        return None
+
+    registered = {name for name in tool_names if name}
+    for name in sorted(registered, key=len, reverse=True):
+        if re.match(
+            rf"^{re.escape(name)}(?:\s*\(|\s+[A-Za-z_][A-Za-z0-9_-]*\s*=)",
+            candidate,
+        ):
+            return name
+
+    fenced = re.match(r"^```(?P<name>[A-Za-z_][A-Za-z0-9_-]*)\s*(?:\r?\n|$)", candidate)
+    if fenced is None:
+        return None
+    printed_name = fenced.group("name")
+    if printed_name in registered:
+        return printed_name
+    aliases = {
+        "skill": "load_skill",
+        "search": "oracle__search",
+    }
+    target = aliases.get(printed_name)
+    return target if target in registered else None
+
+
+def _printed_tool_arguments(tool_name: str, tool_schemas: Sequence[ToolSpec]) -> str:
+    """Return a readable argument list for a registered tool, or ``""``."""
+    for schema in tool_schemas:
+        if not isinstance(schema, dict) or schema.get("name") != tool_name:
+            continue
+        parameters = schema.get("parameters")
+        if not isinstance(parameters, dict):
+            return ""
+        properties = parameters.get("properties")
+        if not isinstance(properties, dict) or not properties:
+            return ""
+        required = parameters.get("required")
+        required_names = set(required) if isinstance(required, list) else set()
+        rendered = [
+            f"{name} (required)" if name in required_names else name for name in properties
+        ]
+        return ", ".join(rendered)
+    return ""
+
+
+def _printed_tool_recovery_prompt(
+    tool_name: str,
+    tool_schemas: Sequence[ToolSpec],
+    attempt: int,
+) -> str:
+    """Build the recovery prompt for a printed tool invocation."""
+    if attempt < 2:
+        return PI_PRINTED_TOOL_RECOVERY.format(tool_name=tool_name)
+    arguments = _printed_tool_arguments(tool_name, tool_schemas)
+    if not arguments:
+        return PI_PRINTED_TOOL_RECOVERY.format(tool_name=tool_name)
+    return PI_PRINTED_TOOL_RECOVERY_WITH_SCHEMA.format(
+        tool_name=tool_name, tool_arguments=arguments
+    )
+
+
 def _aggregate_pi_turn_usage(
     message_usages: list[_PiMessageUsage],
     fallback_model: str | None,
@@ -1678,6 +2073,370 @@ def _aggregate_pi_turn_usage(
     }
 
 
+def _compaction_usage(
+    result: Mapping[str, Any],
+    fallback_model: str | None,
+) -> dict[str, Any] | None:
+    raw = result.get("usage")
+    if not isinstance(raw, Mapping):
+        return None
+    input_tokens = int(raw.get("input") or 0)
+    output_tokens = int(raw.get("output") or 0)
+    cache_read = int(raw.get("cacheRead") or 0)
+    cache_write = int(raw.get("cacheWrite") or 0)
+    total_tokens = int(raw.get("totalTokens") or 0)
+    if not (input_tokens or output_tokens):
+        return None
+    return {
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "total_tokens": total_tokens or (input_tokens + output_tokens),
+        "cache_read_input_tokens": cache_read,
+        "cache_creation_input_tokens": cache_write,
+        "context_tokens": total_tokens
+        or (input_tokens + output_tokens + cache_read + cache_write),
+        "model": fallback_model,
+    }
+
+
+def _latest_user_directive(messages: Sequence[Message]) -> str:
+    for message in reversed(messages):
+        if message.get("role") == "user":
+            text = _extract_text(message).strip()
+            if text:
+                return text
+    return "Continue the current user request."
+
+
+def _git_output(cwd: str, *args: str, strip: bool = True) -> str | None:
+    """Run git in *cwd* and return stdout, or ``None`` when it fails.
+
+    :param strip: Trim surrounding whitespace. Pass ``False`` for
+        ``--porcelain -z``, whose first record opens with the index status —
+        a space for a worktree-only change — that stripping would eat along
+        with the path's own leading blank.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "-C", cwd, *args],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=3.0,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    return result.stdout.strip() if strip else result.stdout
+
+
+def _repository_name(remote: str | None) -> str | None:
+    if not remote:
+        return None
+    match = re.search(r"github\.com[/:]([^/\s]+/[^/\s]+?)(?:\.git)?$", remote)
+    return match.group(1) if match else None
+
+
+#: How far below a non-repository workspace to look for the checkout being
+#: worked on, and how many directories to examine getting there. A sandbox is
+#: laid out ``<workspace>/<org>/<repo>``, so two levels reaches the repo.
+_WORKSPACE_SCAN_DEPTH = 2
+_WORKSPACE_SCAN_LIMIT = 64
+
+
+def _dirty_repository_under(workspace: str) -> str | None:
+    """Return the checkout below *workspace* that has uncommitted work.
+
+    A workspace holding several checkouts is not itself a repository, so
+    ``rev-parse`` at its root reports nothing and a handover taken there
+    carries no file list — the agent is told its own edits do not exist. The
+    repository with changes is the one it was working in.
+
+    Picks the first dirty checkout in sorted order. The handover model holds
+    one repository, so an agent that edited two loses the second here.
+
+    :param workspace: Directory holding one or more checkouts.
+    :returns: Worktree root of the first dirty checkout, or ``None``.
+    """
+    examined = 0
+    frontier = [(pathlib.Path(workspace), 0)]
+    while frontier:
+        current, depth = frontier.pop(0)
+        if depth >= _WORKSPACE_SCAN_DEPTH or examined >= _WORKSPACE_SCAN_LIMIT:
+            continue
+        try:
+            children = sorted(p for p in current.iterdir() if p.is_dir())
+        except OSError:
+            continue
+        for child in children:
+            examined += 1
+            if examined > _WORKSPACE_SCAN_LIMIT:
+                break
+            if child.name.startswith("."):
+                continue
+            if (child / ".git").exists():
+                if _git_output(str(child), "status", "--porcelain=v1"):
+                    return _git_output(str(child), "rev-parse", "--show-toplevel") or str(child)
+                continue
+            frontier.append((child, depth + 1))
+    return None
+
+
+def _capture_repository_state(cwd: str | None) -> RepositoryState | None:
+    """Read bounded Git state without changing the worktree."""
+    if not cwd:
+        return None
+    root = _git_output(cwd, "rev-parse", "--show-toplevel")
+    if not root:
+        root = _dirty_repository_under(cwd)
+    if not root:
+        return RepositoryState(workspace=cwd)
+
+    branch = _git_output(root, "branch", "--show-current") or None
+    head = _git_output(root, "rev-parse", "HEAD") or None
+    upstream_head = _git_output(root, "rev-parse", "@{upstream}") or None
+    remote = _git_output(root, "remote", "get-url", "origin")
+    status = _git_output(root, "status", "--porcelain=v1", "-z", strip=False) or ""
+
+    staged: list[str] = []
+    modified: list[str] = []
+    untracked: list[str] = []
+    deleted: list[str] = []
+    for record in status.split("\0"):
+        if len(record) < 4 or record[2] != " ":
+            continue
+        index_status, worktree_status = record[0], record[1]
+        path = record[3:]
+        if index_status == "?" and worktree_status == "?":
+            untracked.append(path)
+            continue
+        if index_status not in {" ", "?"}:
+            staged.append(path)
+        if worktree_status not in {" ", "?"}:
+            modified.append(path)
+        if "D" in {index_status, worktree_status}:
+            deleted.append(path)
+
+    return RepositoryState(
+        workspace=root,
+        repo=_repository_name(remote),
+        branch=branch,
+        head=head,
+        upstream_head=upstream_head,
+        staged_paths=staged,
+        modified_paths=modified,
+        untracked_paths=untracked,
+        deleted_paths=deleted,
+    )
+
+
+def _build_handover_request(
+    *,
+    config: SmartCompactionConfig,
+    original_directive: str,
+    repository_state: RepositoryState | None,
+) -> str:
+    payload = {
+        "original_directive": original_directive,
+        "agent_instructions": config.instructions,
+        "authoritative_repository_state": (
+            repository_state.model_dump(mode="json") if repository_state is not None else None
+        ),
+        "schema": SemanticHandoverDraft.model_json_schema(),
+    }
+    return "OMNIGENT_STRUCTURED_HANDOVER_V1\n" + json.dumps(
+        payload,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+
+
+#: Argument keys that identify WHAT a call acted on, in preference order. A
+#: bare tool name is useless in ``do_not_repeat`` — "you already ran
+#: sys_os_read" tells the model nothing, "you already read <path>" tells it
+#: everything.
+_CALL_SUBJECT_KEYS = ("path", "command", "query", "question", "ref", "name")
+
+
+def _record_completed_call(
+    completed_calls: dict[str, None],
+    loaded_skills: dict[str, None],
+    tool_name: str,
+    args: object,
+) -> None:
+    """Note one dispatched call so a fallback handover can report it.
+
+    Insertion-ordered dicts used as ordered sets: a call repeated within the
+    turn is recorded once. Only the argument that identifies the subject is
+    kept, capped, so nothing large or secret-bearing rides along — the
+    handover model redacts and caps again on the way in.
+
+    :param completed_calls: Ordered set of rendered ``tool(subject)`` strings,
+        mutated in place.
+    :param loaded_skills: Ordered set of skill names, mutated in place.
+    :param tool_name: The Pi ``toolName`` for this call.
+    :param args: The call's arguments, normally a mapping.
+    """
+    if not isinstance(tool_name, str) or not tool_name:
+        return
+    mapping = args if isinstance(args, Mapping) else {}
+    if tool_name == "load_skill":
+        skill = mapping.get("name")
+        if isinstance(skill, str) and skill:
+            loaded_skills[skill[:128]] = None
+            return
+    subject = ""
+    for key in _CALL_SUBJECT_KEYS:
+        value = mapping.get(key)
+        if isinstance(value, str) and value.strip():
+            subject = " ".join(value.split())[:160]
+            break
+    completed_calls[f"{tool_name}({subject})" if subject else tool_name] = None
+
+
+#: Phase markers, most-advanced first. Each entry is (phase, substrings): a
+#: completed call containing any of the substrings proves the turn reached that
+#: phase. Matched against the rendered ``tool(subject)`` strings, so a shell
+#: command's own text counts — that is where commits and pushes live, since raw
+#: git commit/push is denied and the contribution helper is invoked by name.
+_PHASE_MARKERS: tuple[tuple[CheckpointPhase, tuple[str, ...]], ...] = (
+    ("open_pr", ("create_pull_request", "update_pull_request")),
+    ("commit", ("gh_app_commit", "git push", "prepare_existing_branch")),
+    ("edit", ("sys_os_write", "sys_os_edit")),
+)
+
+
+def _infer_phase(completed_calls: Sequence[str]) -> CheckpointPhase:
+    """Derive how far the turn actually got from what it actually ran.
+
+    A fallback handover cannot ask the model what phase it was in — that is the
+    answer that just failed to arrive. But the framework watched every call, so
+    it can say what the turn demonstrably did. Evidence, not assertion.
+
+    :param completed_calls: Rendered ``tool(subject)`` strings for this turn.
+    :returns: The most advanced phase with evidence behind it, else
+        ``"investigate"`` — which is then a floor, not a claim.
+    """
+    haystack = "\n".join(completed_calls)
+    for phase, markers in _PHASE_MARKERS:
+        if any(marker in haystack for marker in markers):
+            return phase
+    return "investigate"
+
+
+def _handover_from_compaction(
+    *,
+    result: Mapping[str, Any],
+    original_directive: str,
+    repository_state: RepositoryState | None,
+    context_tokens: int,
+    completed_calls: Sequence[str] = (),
+    loaded_skills: Sequence[str] = (),
+    last_phase: CheckpointPhase | None = None,
+) -> SessionHandover:
+    summary = str(result.get("summary") or "")
+    details = result.get("details")
+    if isinstance(details, Mapping) and details.get("type") == "omnigent_session_handover":
+        draft_payload = details.get("draft")
+        if isinstance(draft_payload, Mapping):
+            draft = SemanticHandoverDraft.model_validate(
+                {
+                    **draft_payload,
+                    "original_directive": original_directive,
+                }
+            )
+            return SessionHandover(
+                **draft.model_dump(mode="python"),
+                mode="structured",
+                repository_state=repository_state,
+                context_tokens=context_tokens,
+                created_at=datetime.now(UTC).isoformat(),
+            )
+
+    fallback_text = summary or "The structured handover was unavailable."
+    # The model did not produce the structured object, so everything below is
+    # what the framework knows on its own. This branch used to assert
+    # phase="investigate" unconditionally, which told a half-finished task it
+    # was still in discovery: session 3cbedace came back from a rollover and
+    # re-read six files it had already read, loaded one skill three times, and
+    # died on the loop guard with 49 tool calls and no writes. A fallback may
+    # not know the phase; it must not invent one.
+    # Derived, not asserted: last_phase is an override for a caller that knows
+    # better, and nothing does today. Before this, the fallback logged
+    # "phase=unknown" and defaulted to investigate on every rollover.
+    phase = last_phase or _infer_phase(completed_calls)
+    logger.warning(
+        "structured handover unavailable; falling back to a generic handover "
+        "(phase=%s, completed_calls=%d, loaded_skills=%d)",
+        phase,
+        len(completed_calls),
+        len(loaded_skills),
+    )
+    return SessionHandover(
+        mode="generic",
+        original_directive=original_directive,
+        objective=(
+            "Continue the original directive above. The structured handover was "
+            "unavailable, so treat the directive as the specification and the "
+            "summary below only as a progress note."
+        ),
+        # Carry the phase forward when the turn reached one. "investigate" is
+        # the floor, reached only when no call proved anything further.
+        phase=phase,
+        remaining_work=[
+            "Re-read the original directive and resume at its first unmet requirement."
+        ],
+        next_action=(
+            "Take the first action the original directive requires that is not "
+            "already listed in do_not_repeat."
+        ),
+        # The continuation prompt tells the model not to repeat these, and this
+        # branch used to hand it an empty list.
+        do_not_repeat=list(completed_calls),
+        loaded_skills=list(loaded_skills),
+        repository_state=repository_state,
+        context_tokens=context_tokens,
+        fallback_summary=fallback_text,
+        created_at=datetime.now(UTC).isoformat(),
+    )
+
+
+def _handover_continuation(handover: SessionHandover) -> str:
+    payload = json.dumps(handover.model_dump(mode="json"), ensure_ascii=False)
+    return (
+        "Framework context rollover completed. Continue the same task automatically. "
+        "Treat repository_state as authoritative, start with next_action, preserve completed "
+        "outcomes, and do not repeat do_not_repeat items. Do not summarize again or ask the "
+        f"user to restart. <session_handover>{payload}</session_handover>"
+    )
+
+
+def _handover_compacted_messages(handover: SessionHandover) -> list[Message]:
+    return [
+        {
+            "type": "message",
+            "role": "user",
+            "content": [
+                {
+                    "type": "input_text",
+                    "text": handover.original_directive,
+                }
+            ],
+        },
+        {
+            "type": "message",
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "output_text",
+                    "text": _handover_continuation(handover),
+                }
+            ],
+        },
+    ]
+
+
 class PiExecutor(Executor):
     """Execute agent turns via the Pi coding agent (``pi --mode rpc``)."""
 
@@ -1699,6 +2458,7 @@ class PiExecutor(Executor):
         bundle_dir: pathlib.Path | None = None,
         agent_name: str | None = None,
         skills_filter: str | list[str] = "all",
+        smart_compaction: SmartCompactionConfig | None = None,
     ) -> None:
         """Create a PiExecutor.
 
@@ -1756,6 +2516,8 @@ class PiExecutor(Executor):
             so Pi sees zero skills; a list adds ``--no-skills`` plus
             ``--skill`` for each named bundle skill — names not
             present in the bundle are silently skipped.
+        :param smart_compaction: Optional configured threshold and semantic
+            handover settings for resetting long Pi contexts.
         """
         resolved_pi = pi_path or _find_pi_cli()
         if not resolved_pi:
@@ -1809,6 +2571,7 @@ class PiExecutor(Executor):
         self._bundle_dir = bundle_dir
         self._agent_name = agent_name
         self._skills_filter = skills_filter
+        self._smart_compaction = smart_compaction or SmartCompactionConfig()
         # Resolve once at construction (the bundle layout doesn't
         # change across turns within a session). Each turn's
         # ``_build_env_and_dir`` copies ``self._extra_args`` so this
@@ -2160,7 +2923,10 @@ class PiExecutor(Executor):
 
             prepare_managed_pi_agent_dir(
                 pathlib.Path(tmp_dir),
-                overlay=self._retry_policy.pi.settings(),
+                overlay=_pi_settings_overlay(
+                    self._retry_policy.pi.settings(),
+                    self._smart_compaction,
+                ),
             )
 
         # Pi natively supports retry config via ``.pi/settings.json``
@@ -2169,7 +2935,10 @@ class PiExecutor(Executor):
         # Gateway runs apply retry via :func:`prepare_managed_pi_agent_dir`
         # into the managed agent dir instead.
         if not self._gateway:
-            retry_settings = self._retry_policy.pi.settings()
+            retry_settings = _pi_settings_overlay(
+                self._retry_policy.pi.settings(),
+                self._smart_compaction,
+            )
             settings_dir_root = self._cwd or tmp_dir
             settings_path = os.path.join(settings_dir_root, ".pi", "settings.json")
             try:
@@ -2189,6 +2958,12 @@ class PiExecutor(Executor):
                 os.makedirs(os.path.dirname(fallback_path), exist_ok=True)
                 with open(fallback_path, "w") as f:
                     json.dump(retry_settings, f, indent=2)
+
+        if self._smart_compaction.enabled:
+            handover_path = os.path.join(tmp_dir, "omnigent_handover.js")
+            with open(handover_path, "w") as f:
+                f.write(_generate_handover_extension_js(self._smart_compaction))
+            extra_args.extend(["--extension", handover_path])
 
         # Generate the Omnigent tool bridge extension if tools are available.
         if tools and tool_server_port is not None:
@@ -2292,7 +3067,63 @@ class PiExecutor(Executor):
         state._has_sent_prompt = False
         return rpc
 
+    async def _restart_rpc_for_handover(
+        self,
+        *,
+        session_key: str,
+        current_rpc: _PiRpcSession,
+        system_prompt: str,
+        model: str | None,
+        tools: list[ToolSpec],
+        continuation: str,
+        command_id: str,
+    ) -> _PiRpcSession:
+        """Start a fresh Pi process and load the validated handover."""
+        state = self._session_states.setdefault(session_key, _PiSessionState())
+        if state.rpc is current_rpc:
+            await current_rpc.close()
+            state.rpc = None
+        rpc = await self._ensure_rpc(session_key, system_prompt, model, tools)
+        state = self._session_states.get(session_key)
+        if state is not None:
+            state._has_sent_prompt = True
+        await rpc.send_command(
+            {
+                "type": "prompt",
+                "message": continuation,
+                "id": command_id,
+            }
+        )
+        return rpc
+
     async def run_turn(
+        self,
+        messages: list[Message],
+        tools: list[ToolSpec],
+        system_prompt: str,
+        config: ExecutorConfig | None = None,
+    ) -> AsyncIterator[ExecutorEvent]:
+        """Run one turn, stopping Pi if the turn is cancelled.
+
+        ``CancelledError`` is a ``BaseException``, so a watchdog-cancelled turn
+        skips every ``except Exception`` boundary in the body below and unwinds
+        without telling Pi anything. The subprocess then keeps running the
+        request the scaffold has already given up on, and the model call behind
+        it keeps holding the accelerator — once observed as two generations
+        running at the same time, the abandoned one for another 516 seconds.
+        Interrupting here aborts the in-flight turn and drops the session, the
+        same cleanup :meth:`interrupt_session` does for an explicit stop.
+        """
+        session_key = self._session_key(messages)
+        try:
+            async for event in self._run_turn(messages, tools, system_prompt, config):
+                yield event
+        except asyncio.CancelledError:
+            with contextlib.suppress(Exception):
+                await self.interrupt_session(session_key)
+            raise
+
+    async def _run_turn(
         self,
         messages: list[Message],
         tools: list[ToolSpec],
@@ -2311,9 +3142,17 @@ class PiExecutor(Executor):
                     self._databricks_token = token
         session_key = self._session_key(messages)
         model = await self._resolve_model(config)
+        original_directive = _latest_user_directive(messages)
+        pi_system_prompt = (
+            append_framework_instructions(
+                system_prompt,
+                (PI_AGENT_COMPLETION_INSTRUCTION,),
+            )
+            or PI_AGENT_COMPLETION_INSTRUCTION
+        )
 
         try:
-            rpc = await self._ensure_rpc(session_key, system_prompt, model, tools)
+            rpc = await self._ensure_rpc(session_key, pi_system_prompt, model, tools)
         except Exception as exc:  # noqa: BLE001 — executor boundary surfaces startup errors as ExecutorError
             yield ExecutorError(message=f"Failed to start Pi: {exc}")
             return
@@ -2364,6 +3203,17 @@ class PiExecutor(Executor):
         # Read events until agent_end.
         response_text = ""
         streamed_any = False
+        saw_tool_activity = False
+        completion_text_ready = False
+        last_tool_failed = False
+        failure_recovery_requested = False
+        tool_turn_continuations = 0
+        wedge_restarts = 0
+        # Set by the continuation helpers when the caller must stop reading the
+        # event stream: the turn has already been ended or failed.
+        tool_turn_stop = False
+        active_tool_calls = 0
+        active_tool_started_at: float | None = None
         # Per-LLM-call token usage captured from each assistant message pi
         # forwards (``message_end`` is the capture site; ``agent_end`` is a
         # fallback). Summed into a turn-level usage dict at completion so a
@@ -2373,14 +3223,239 @@ class PiExecutor(Executor):
         # Error reported by a ``message_end`` (stopReason=error); surfaced at
         # ``agent_end`` so the terminal event is consumed off the RPC stream.
         pending_error: str | None = None
+        saw_message_end = False
+        last_assistant_requested_tool = False
+        pending_llm_input: list[Message] = []
+        handover_due_context_tokens = 0
+        handover_in_progress = False
+        handover_started_at: float | None = None
+        handover_command_id: str | None = None
+        handover_repository_state: RepositoryState | None = None
+        handover_llm_started = False
+        handover_count = 0
+        printed_tool_recoveries = 0
+        text_gate_open = False
+        text_gate_buffer = ""
+        text_gate_suppressed = False
+        # What this turn has already done, kept so a fallback handover can say
+        # so. The model is asked for the same thing and does not always answer;
+        # this is the part the framework can know without being told. Ordered
+        # and deduplicated, because the value is "you already read this", not
+        # "you read this six times".
+        completed_calls: dict[str, None] = {}
+        loaded_skills: dict[str, None] = {}
+        registered_tool_names = tuple(
+            name for name in (tool.get("name") for tool in tools) if isinstance(name, str)
+        )
+
+        async def _restart_wedged_tool_turn() -> AsyncIterator[ExecutorEvent]:
+            """Recover a turn Pi abandoned after its tool calls.
+
+            A spent continuation budget means Pi is not coming back on its own,
+            and the usual cause is a transcript it can no longer answer over. So
+            take the smart-compaction path's remedy: a fresh process behind a
+            framework handover, which carries the directive and the calls
+            already made without the transcript that wedged it.
+            """
+            nonlocal rpc, cmd_id, handover_count, wedge_restarts
+            nonlocal handover_repository_state, pending_llm_input, pending_error
+            nonlocal saw_message_end, completion_text_ready, last_tool_failed
+            nonlocal failure_recovery_requested, tool_turn_continuations
+            nonlocal active_tool_calls, active_tool_started_at
+            nonlocal response_text, tool_turn_stop
+
+            tool_turn_stop = True
+            if wedge_restarts >= _TOOL_TURN_MAX_WEDGE_RESTARTS:
+                # A restarted process went silent too. End the turn with the
+                # handoff rather than an error: the tool results stand, and the
+                # session takes the next message.
+                logger.warning(
+                    "pi abandoned a tool-driven turn after %d restart(s); "
+                    "ending the turn with a handoff",
+                    wedge_restarts,
+                )
+                response_text = PI_TOOL_TURN_WEDGED_RESPONSE
+                yield TextChunk(text=PI_TOOL_TURN_WEDGED_RESPONSE)
+                turn_usage = _aggregate_pi_turn_usage(message_usages, model)
+                _notify_usage_from_dict(model=model, usage=turn_usage)
+                yield TurnComplete(
+                    response=response_text,
+                    usage=dict(turn_usage) if turn_usage is not None else None,
+                )
+                return
+
+            wedge_restarts += 1
+            logger.warning(
+                "pi ended a tool-driven turn without a final response after %d "
+                "continuations; restarting it behind a handover",
+                _TOOL_TURN_MAX_CONTINUATIONS,
+            )
+            if handover_repository_state is None:
+                handover_repository_state = cast(
+                    RepositoryState | None,
+                    await run_sync_on_thread(_capture_repository_state, self._cwd),
+                )
+            handover = _handover_from_compaction(
+                result={"summary": PI_TOOL_TURN_WEDGED_SUMMARY},
+                original_directive=original_directive,
+                repository_state=handover_repository_state,
+                context_tokens=handover_due_context_tokens,
+                completed_calls=tuple(completed_calls),
+                loaded_skills=tuple(loaded_skills),
+            )
+            continuation = _handover_continuation(handover)
+            handover_count += 1
+            cmd_id = f"turn_{id(messages)}_handover_{handover_count}"
+            try:
+                rpc = await self._restart_rpc_for_handover(
+                    session_key=session_key,
+                    current_rpc=rpc,
+                    system_prompt=pi_system_prompt,
+                    model=model,
+                    tools=tools,
+                    continuation=continuation,
+                    command_id=cmd_id,
+                )
+            except Exception as exc:  # noqa: BLE001
+                yield ExecutorError(
+                    message=f"Failed to restart Pi after an abandoned tool turn: {exc}",
+                    retryable=True,
+                )
+                return
+            pending_llm_input = [{"role": "user", "content": continuation}]
+            pending_error = None
+            saw_message_end = False
+            completion_text_ready = False
+            last_tool_failed = False
+            failure_recovery_requested = False
+            tool_turn_continuations = 0
+            active_tool_calls = 0
+            active_tool_started_at = None
+            tool_turn_stop = False
+            yield CompactionComplete(
+                summary=handover.fallback_summary,
+                token_count=0,
+                model=model,
+                compacted_messages=_handover_compacted_messages(handover),
+                handover=handover.model_dump(mode="json"),
+                handover_loaded=True,
+            )
+
+        async def _continue_tool_turn(
+            *,
+            recover_failure: bool,
+        ) -> AsyncIterator[ExecutorEvent]:
+            nonlocal completion_text_ready
+            nonlocal failure_recovery_requested
+            nonlocal tool_turn_continuations
+            nonlocal tool_turn_stop
+
+            if tool_turn_continuations >= _TOOL_TURN_MAX_CONTINUATIONS:
+                async for restart_event in _restart_wedged_tool_turn():
+                    yield restart_event
+                return
+            tool_turn_continuations += 1
+            completion_text_ready = False
+            if recover_failure:
+                failure_recovery_requested = True
+            try:
+                await rpc.send_command(
+                    {
+                        "type": "prompt",
+                        "message": PI_TOOL_TURN_CONTINUATION,
+                        "id": f"{cmd_id}_continue_{tool_turn_continuations}",
+                        "streamingBehavior": "followUp",
+                    }
+                )
+            except Exception as exc:  # noqa: BLE001
+                tool_turn_stop = True
+                yield ExecutorError(
+                    message=f"Failed to continue incomplete Pi tool turn: {exc}",
+                    retryable=True,
+                )
 
         while True:
             # After an errored message the only thing left to drain is the
             # already-emitted agent_end, so don't wait the full idle budget.
-            line = await rpc.read_line(timeout=120.0 if pending_error is None else 10.0)
+            if pending_error is not None:
+                read_timeout = 10.0
+            elif saw_tool_activity and active_tool_calls == 0:
+                # Three silent waits (initial + two continuations) must finish
+                # before the scaffold's default 240-second idle watchdog.
+                read_timeout = _POST_TOOL_EVENT_IDLE_TIMEOUT_SECONDS
+            else:
+                read_timeout = 120.0
+            if handover_in_progress:
+                started_at = handover_started_at or time.monotonic()
+                remaining = self._smart_compaction.timeout_seconds - (
+                    time.monotonic() - started_at
+                )
+                if remaining <= 0:
+                    error_text = (
+                        "Pi structured handover did not complete within "
+                        f"{int(self._smart_compaction.timeout_seconds)} seconds."
+                    )
+                    if handover_llm_started:
+                        yield LLMCallComplete(
+                            model=model,
+                            error=error_text,
+                        )
+                    yield ExecutorError(
+                        message=error_text,
+                        retryable=True,
+                    )
+                    return
+                read_timeout = min(self._smart_compaction.poll_interval_seconds, remaining)
+            line = await rpc.read_line(timeout=read_timeout)
             if line is None:
+                if handover_in_progress:
+                    # Say so, the way a long-running tool call does above.
+                    # A handover is one uninterrupted model call and routinely
+                    # outlasts the scaffold's 240-second idle watchdog, so a
+                    # silent poll loop lets that watchdog fail the turn before
+                    # this timeout — the larger budget above never gets to
+                    # apply, and the abandoned call keeps generating.
+                    yield ExecutorProgress()
+                    continue
                 if pending_error is not None:
                     yield ExecutorError(message=pending_error)
+                elif active_tool_calls:
+                    if not rpc._last_read_timed_out:
+                        yield ExecutorError(
+                            message="Pi process ended while a tool call was still running.",
+                            retryable=True,
+                        )
+                        return
+                    elapsed = (
+                        time.monotonic() - active_tool_started_at
+                        if active_tool_started_at is not None
+                        else 0.0
+                    )
+                    if elapsed < _TOOL_EXECUTION_MAX_SECONDS:
+                        logger.info(
+                            "PiExecutor: tool call still running after %.1fs; waiting",
+                            elapsed,
+                        )
+                        yield ExecutorProgress()
+                        continue
+                    yield ExecutorError(
+                        message=(
+                            "Pi tool execution did not complete within "
+                            f"{int(_TOOL_EXECUTION_MAX_SECONDS)} seconds."
+                        ),
+                        retryable=True,
+                    )
+                elif saw_tool_activity and (
+                    not completion_text_ready
+                    or (last_tool_failed and not failure_recovery_requested)
+                ):
+                    async for continuation_event in _continue_tool_turn(
+                        recover_failure=(last_tool_failed and not failure_recovery_requested),
+                    ):
+                        yield continuation_event
+                    if tool_turn_stop:
+                        return
+                    continue
                 elif not streamed_any and not response_text:
                     stderr = "\n".join(rpc._stderr_lines) if rpc._stderr_lines else ""
                     stderr_suffix = f" Stderr: {stderr}" if stderr else ""
@@ -2408,8 +3483,85 @@ class PiExecutor(Executor):
             # Skip the command-ack response.
             if event_type == "response":
                 if not event.get("success", True):
+                    if handover_in_progress and event.get("id") == handover_command_id:
+                        error_text = str(event.get("error") or "Pi compaction command failed")
+                        if handover_llm_started:
+                            yield LLMCallComplete(
+                                model=model,
+                                error=error_text,
+                            )
+                            handover_llm_started = False
+                        handover = _handover_from_compaction(
+                            result={"summary": error_text},
+                            original_directive=original_directive,
+                            repository_state=handover_repository_state,
+                            context_tokens=handover_due_context_tokens,
+                            completed_calls=tuple(completed_calls),
+                            loaded_skills=tuple(loaded_skills),
+                        )
+                        continuation = _handover_continuation(handover)
+                        handover_count += 1
+                        cmd_id = f"turn_{id(messages)}_handover_{handover_count}"
+                        try:
+                            rpc = await self._restart_rpc_for_handover(
+                                session_key=session_key,
+                                current_rpc=rpc,
+                                system_prompt=pi_system_prompt,
+                                model=model,
+                                tools=tools,
+                                continuation=continuation,
+                                command_id=cmd_id,
+                            )
+                        except Exception as exc:  # noqa: BLE001
+                            yield ExecutorError(
+                                message=f"Failed to load fallback Pi handover: {exc}",
+                                retryable=True,
+                            )
+                            return
+                        pending_llm_input = [{"role": "user", "content": continuation}]
+                        handover_in_progress = False
+                        handover_started_at = None
+                        handover_command_id = None
+                        handover_due_context_tokens = 0
+                        handover_repository_state = None
+                        pending_error = None
+                        saw_message_end = False
+                        completion_text_ready = False
+                        last_tool_failed = False
+                        failure_recovery_requested = False
+                        tool_turn_continuations = 0
+                        active_tool_calls = 0
+                        active_tool_started_at = None
+                        yield CompactionComplete(
+                            summary=handover.fallback_summary,
+                            token_count=0,
+                            model=model,
+                            compacted_messages=_handover_compacted_messages(handover),
+                            handover=handover.model_dump(mode="json"),
+                            handover_loaded=True,
+                        )
+                        continue
                     yield ExecutorError(message=event.get("error", "Pi command failed"))
                     return
+                continue
+
+            if event_type == "message_start":
+                message_started = event.get("message")
+                if (
+                    isinstance(message_started, dict)
+                    and message_started.get("role") == "assistant"
+                ):
+                    saw_message_end = False
+                    last_assistant_requested_tool = False
+                    text_gate_open = False
+                    text_gate_buffer = ""
+                    text_gate_suppressed = False
+                    call_input = list(pending_llm_input) or None
+                    pending_llm_input.clear()
+                    yield LLMCallStarted(
+                        model=_pi_message_model(message_started, model),
+                        input=call_input,
+                    )
                 continue
 
             # Streaming text and thinking deltas.
@@ -2419,9 +3571,29 @@ class PiExecutor(Executor):
                 if ame_type == "text_delta":
                     raw_delta = ame.get("delta")
                     if isinstance(raw_delta, str) and raw_delta:
-                        yield TextChunk(text=raw_delta)
+                        # Hold the opening characters back until they can be
+                        # classified. A printed tool invocation is recognisable
+                        # from its start, and streaming it would put the wrong
+                        # call format in the transcript for the next turn to
+                        # copy. Tracking is unaffected — only emission waits.
+                        if text_gate_open:
+                            yield TextChunk(text=raw_delta)
+                        else:
+                            text_gate_buffer += raw_delta
+                            if len(text_gate_buffer) >= _PRINTED_TOOL_GATE_CHARS:
+                                if (
+                                    _printed_tool_target(text_gate_buffer, registered_tool_names)
+                                    is not None
+                                ):
+                                    text_gate_suppressed = True
+                                else:
+                                    text_gate_open = True
+                                    yield TextChunk(text=text_gate_buffer)
+                                text_gate_buffer = ""
                         response_text += raw_delta
                         streamed_any = True
+                        if raw_delta.strip():
+                            completion_text_ready = True
                 elif ame_type == "thinking_start":
                     # Anchors the "Thinking…" indicator before the first delta.
                     yield ReasoningChunk(delta="", event_type="reasoning_started")
@@ -2434,8 +3606,14 @@ class PiExecutor(Executor):
 
             # Tool execution events.
             if event_type == "tool_execution_start":
+                saw_tool_activity = True
+                completion_text_ready = False
+                if active_tool_calls == 0:
+                    active_tool_started_at = time.monotonic()
+                active_tool_calls += 1
                 tool_name = event.get("toolName", "unknown")
                 args = event.get("args", {})
+                _record_completed_call(completed_calls, loaded_skills, tool_name, args)
                 yield ToolCallRequest(
                     name=tool_name,
                     args=args if isinstance(args, dict) else {},
@@ -2443,6 +3621,10 @@ class PiExecutor(Executor):
                 continue
 
             if event_type == "tool_execution_end":
+                saw_tool_activity = True
+                active_tool_calls = max(0, active_tool_calls - 1)
+                if active_tool_calls == 0:
+                    active_tool_started_at = None
                 tool_name = event.get("toolName", "unknown")
                 is_error = event.get("isError", False)
                 result = event.get("result")
@@ -2506,6 +3688,10 @@ class PiExecutor(Executor):
                     status = ToolCallStatus.ERROR
                 else:
                     status = ToolCallStatus.SUCCESS
+                completion_text_ready = False
+                last_tool_failed = status in (ToolCallStatus.BLOCKED, ToolCallStatus.ERROR)
+                failure_recovery_requested = False
+                tool_turn_continuations = 0
 
                 yield ToolCallComplete(
                     name=tool_name,
@@ -2515,28 +3701,287 @@ class PiExecutor(Executor):
                 )
                 continue
 
+            if event_type == "turn_end":
+                tool_results = event.get("toolResults")
+                if (
+                    self._smart_compaction.enabled
+                    and handover_due_context_tokens >= self._smart_compaction.trigger_tokens
+                    and isinstance(tool_results, list)
+                    and len(tool_results) > 0
+                    and not handover_in_progress
+                ):
+                    handover_repository_state = cast(
+                        RepositoryState | None,
+                        await run_sync_on_thread(_capture_repository_state, self._cwd),
+                    )
+                    request_text = _build_handover_request(
+                        config=self._smart_compaction,
+                        original_directive=original_directive,
+                        repository_state=handover_repository_state,
+                    )
+                    handover_command_id = f"handover_{id(messages)}_{handover_count + 1}"
+                    handover_in_progress = True
+                    handover_started_at = time.monotonic()
+                    try:
+                        await rpc.send_command(
+                            {
+                                "type": "compact",
+                                "customInstructions": request_text,
+                                "id": handover_command_id,
+                            }
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        yield ExecutorError(
+                            message=f"Failed to start Pi structured handover: {exc}",
+                            retryable=True,
+                        )
+                        return
+                continue
+
+            if event_type == "compaction_start":
+                if handover_in_progress and not handover_llm_started:
+                    handover_started_at = time.monotonic()
+                    handover_llm_started = True
+                    yield LLMCallStarted(
+                        model=model,
+                        input=[
+                            {
+                                "role": "user",
+                                "content": "Generate a structured session handover.",
+                            }
+                        ],
+                    )
+                continue
+
+            if event_type == "compaction_end":
+                raw_result = event.get("result")
+                if not isinstance(raw_result, Mapping):
+                    if not handover_in_progress:
+                        continue
+                    raw_result = {
+                        "summary": str(
+                            event.get("errorMessage")
+                            or "Pi structured handover did not return a summary."
+                        )
+                    }
+
+                if not handover_in_progress:
+                    yield CompactionComplete(
+                        summary=str(raw_result.get("summary") or ""),
+                        token_count=int(raw_result.get("estimatedTokensAfter") or 0),
+                        model=model,
+                    )
+                    continue
+
+                if handover_llm_started:
+                    yield LLMCallComplete(
+                        model=model,
+                        usage=_compaction_usage(raw_result, model),
+                        response=str(raw_result.get("summary") or ""),
+                    )
+                    handover_llm_started = False
+                try:
+                    handover = _handover_from_compaction(
+                        result=raw_result,
+                        original_directive=original_directive,
+                        repository_state=handover_repository_state,
+                        context_tokens=handover_due_context_tokens,
+                        completed_calls=tuple(completed_calls),
+                        loaded_skills=tuple(loaded_skills),
+                    )
+                except (TypeError, ValueError):
+                    handover = _handover_from_compaction(
+                        result={"summary": str(raw_result.get("summary") or "")},
+                        original_directive=original_directive,
+                        repository_state=handover_repository_state,
+                        context_tokens=handover_due_context_tokens,
+                        completed_calls=tuple(completed_calls),
+                        loaded_skills=tuple(loaded_skills),
+                    )
+                continuation = _handover_continuation(handover)
+                handover_count += 1
+                cmd_id = f"turn_{id(messages)}_handover_{handover_count}"
+                try:
+                    rpc = await self._restart_rpc_for_handover(
+                        session_key=session_key,
+                        current_rpc=rpc,
+                        system_prompt=pi_system_prompt,
+                        model=model,
+                        tools=tools,
+                        continuation=continuation,
+                        command_id=cmd_id,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    yield ExecutorError(
+                        message=f"Failed to load Pi structured handover: {exc}",
+                        retryable=True,
+                    )
+                    return
+
+                pending_llm_input = [{"role": "user", "content": continuation}]
+                handover_in_progress = False
+                handover_started_at = None
+                handover_command_id = None
+                handover_due_context_tokens = 0
+                handover_repository_state = None
+                pending_error = None
+                saw_message_end = False
+                completion_text_ready = False
+                last_tool_failed = False
+                failure_recovery_requested = False
+                tool_turn_continuations = 0
+                active_tool_calls = 0
+                active_tool_started_at = None
+                yield CompactionComplete(
+                    summary=str(raw_result.get("summary") or ""),
+                    token_count=int(raw_result.get("estimatedTokensAfter") or 0),
+                    model=model,
+                    compacted_messages=_handover_compacted_messages(handover),
+                    handover=handover.model_dump(mode="json"),
+                    handover_loaded=True,
+                )
+                continue
+
             # Agent ended — the turn is complete.
             if event_type == "agent_end":
+                if handover_in_progress:
+                    continue
                 if pending_error is not None:
                     yield ExecutorError(message=pending_error)
                     return
                 end_messages = event.get("messages", [])
-                if not response_text:
+                end_response_text = ""
+                last_assistant: object = None
+                if isinstance(end_messages, list):
                     for m in reversed(end_messages):
-                        if m.get("role") == "assistant":
-                            content = m.get("content", [])
-                            if isinstance(content, str):
-                                response_text = content
-                            elif isinstance(content, list):
-                                text_parts: list[str] = []
-                                for part in content:
-                                    if not (isinstance(part, dict) and part.get("type") == "text"):
-                                        continue
-                                    part_text = part.get("text")
-                                    if isinstance(part_text, str):
-                                        text_parts.append(part_text)
-                                response_text = "".join(text_parts)
-                            break
+                        if not isinstance(m, dict) or m.get("role") != "assistant":
+                            continue
+                        last_assistant = m
+                        last_assistant_requested_tool = _pi_message_has_tool_call(m)
+                        content = m.get("content", [])
+                        if isinstance(content, str):
+                            end_response_text = content
+                        elif isinstance(content, list):
+                            if any(
+                                isinstance(part, dict) and part.get("type") == "toolCall"
+                                for part in content
+                            ):
+                                break
+                            text_parts: list[str] = []
+                            for part in content:
+                                if not (isinstance(part, dict) and part.get("type") == "text"):
+                                    continue
+                                part_text = part.get("text")
+                                if isinstance(part_text, str):
+                                    text_parts.append(part_text)
+                            end_response_text = "".join(text_parts)
+                        break
+                fallback_usage = None
+                if (
+                    not saw_message_end
+                    and last_assistant is not None
+                    and not _pi_message_has_tool_call(last_assistant)
+                ):
+                    fallback_usage = _extract_pi_turn_usage(last_assistant, model)
+                    if fallback_usage is not None:
+                        message_usages.append(fallback_usage)
+                    call_response, call_reasoning = _extract_pi_message_output(last_assistant)
+                    yield LLMCallComplete(
+                        model=_pi_message_model(last_assistant, model),
+                        usage=dict(fallback_usage) if fallback_usage is not None else None,
+                        response=call_response,
+                        reasoning=call_reasoning,
+                    )
+                if end_response_text.strip():
+                    completion_text_ready = True
+                    if not response_text:
+                        response_text = end_response_text
+
+                if (
+                    printed_tool_recoveries > 0
+                    and not response_text.strip()
+                    and not end_response_text.strip()
+                    and not last_assistant_requested_tool
+                ):
+                    yield ExecutorError(
+                        message="Pi ended printed tool recovery without a response.",
+                        retryable=True,
+                    )
+                    return
+
+                printed_tool_text = end_response_text or response_text
+                printed_tool_target = (
+                    _printed_tool_target(printed_tool_text, registered_tool_names)
+                    if not last_assistant_requested_tool
+                    and printed_tool_recoveries < _PRINTED_TOOL_MAX_RECOVERIES
+                    else None
+                )
+                if printed_tool_target is None and printed_tool_recoveries > 0:
+                    # Every retry still printed. Drop the printed text so it
+                    # never lands in the transcript, where the next turn would
+                    # copy the format it sees.
+                    still_printed = _printed_tool_target(printed_tool_text, registered_tool_names)
+                    if still_printed is not None:
+                        logger.warning(
+                            "pi printed tool invocation for %s after %d recoveries; "
+                            "discarding printed text",
+                            still_printed,
+                            printed_tool_recoveries,
+                        )
+                        # The printed text was gated out of the stream, so the
+                        # turn would otherwise end silent. Stream the handoff
+                        # instead — the adapter drops TurnComplete.response.
+                        response_text = PI_PRINTED_TOOL_EXHAUSTED_RESPONSE
+                        completion_text_ready = True
+                        yield TextChunk(text=PI_PRINTED_TOOL_EXHAUSTED_RESPONSE)
+                if printed_tool_target is not None:
+                    printed_tool_recoveries += 1
+                    logger.warning(
+                        "pi printed tool invocation instead of calling %s; recovery %d/%d",
+                        printed_tool_target,
+                        printed_tool_recoveries,
+                        _PRINTED_TOOL_MAX_RECOVERIES,
+                    )
+                    recovery_prompt = _printed_tool_recovery_prompt(
+                        printed_tool_target, tools, printed_tool_recoveries
+                    )
+                    pending_llm_input = [{"role": "user", "content": recovery_prompt}]
+                    response_text = ""
+                    streamed_any = False
+                    completion_text_ready = False
+                    try:
+                        await rpc.send_command(
+                            {
+                                "type": "prompt",
+                                "message": recovery_prompt,
+                                "id": f"{cmd_id}_printed_tool_recovery",
+                                "streamingBehavior": "followUp",
+                            }
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        yield ExecutorError(
+                            message=f"Failed to recover printed Pi tool intent: {exc}",
+                            retryable=True,
+                        )
+                        return
+                    continue
+
+                needs_completion_text = saw_tool_activity and not completion_text_ready
+                needs_failure_recovery = last_tool_failed and not failure_recovery_requested
+                if needs_completion_text or needs_failure_recovery:
+                    if (
+                        tool_turn_continuations >= _TOOL_TURN_MAX_CONTINUATIONS
+                        and completion_text_ready
+                    ):
+                        needs_failure_recovery = False
+                    if needs_completion_text or needs_failure_recovery:
+                        async for continuation_event in _continue_tool_turn(
+                            recover_failure=needs_failure_recovery,
+                        ):
+                            yield continuation_event
+                        if tool_turn_stop:
+                            return
+                        continue
                 # Fallback usage capture: if no ``message_end`` carried
                 # usage, pull it from the last assistant message in
                 # ``messages`` (only the last — ``messages`` may hold the
@@ -2560,23 +4005,64 @@ class PiExecutor(Executor):
             # each for the turn-level sum before handling error stop reasons.
             if event_type == "message_end":
                 msg = event.get("message", {})
-                if isinstance(msg, dict):
-                    captured = _extract_pi_turn_usage(msg, model)
-                    if captured is not None:
-                        message_usages.append(captured)
-                    raw_stop = msg.get("stopReason")
-                    stop: str | None = raw_stop if isinstance(raw_stop, str) else None
-                    if stop == "aborted":
-                        err = msg.get("errorMessage", stop)
-                        yield ExecutorError(message=str(err))
-                        return
-                    if stop == "error":
-                        # Pi emits the turn-terminal ``agent_end`` after an
-                        # errored LLM call; returning here would leave it
-                        # queued, so the next turn on this RPC session reads
-                        # the stale event as its own end. Record the error
-                        # and keep draining until ``agent_end``.
-                        pending_error = str(msg.get("errorMessage", stop))
+                if not isinstance(msg, dict) or msg.get("role") != "assistant":
+                    traced_input = _pi_trace_input_message(msg)
+                    if traced_input is not None:
+                        pending_llm_input.append(traced_input)
+                    continue
+                saw_message_end = True
+                # The message ended before the gate filled, so classify the
+                # short text now rather than releasing it unchecked.
+                if text_gate_buffer and not text_gate_suppressed:
+                    if _printed_tool_target(text_gate_buffer, registered_tool_names) is None:
+                        yield TextChunk(text=text_gate_buffer)
+                        text_gate_open = True
+                    else:
+                        text_gate_suppressed = True
+                text_gate_buffer = ""
+                last_assistant_requested_tool = _pi_message_has_tool_call(msg)
+                captured = _extract_pi_turn_usage(msg, model)
+                if captured is not None:
+                    message_usages.append(captured)
+                    context_tokens = captured["total_tokens"] or (
+                        captured["input_tokens"]
+                        + captured["output_tokens"]
+                        + captured["cache_read_input_tokens"]
+                        + captured["cache_creation_input_tokens"]
+                    )
+                    if (
+                        self._smart_compaction.enabled
+                        and context_tokens >= self._smart_compaction.trigger_tokens
+                    ):
+                        handover_due_context_tokens = max(
+                            handover_due_context_tokens,
+                            context_tokens,
+                        )
+                raw_stop = msg.get("stopReason")
+                stop: str | None = raw_stop if isinstance(raw_stop, str) else None
+                call_error = None
+                if stop in {"aborted", "error"}:
+                    call_error = str(msg.get("errorMessage", stop))
+                if stop == "aborted" and handover_in_progress:
+                    call_error = None
+                call_response, call_reasoning = _extract_pi_message_output(msg)
+                yield LLMCallComplete(
+                    model=_pi_message_model(msg, model),
+                    usage=dict(captured) if captured is not None else None,
+                    response=call_response,
+                    reasoning=call_reasoning,
+                    error=call_error,
+                )
+                if stop == "aborted" and not handover_in_progress:
+                    yield ExecutorError(message=call_error or stop)
+                    return
+                if stop == "error":
+                    # Pi emits the turn-terminal ``agent_end`` after an
+                    # errored LLM call; returning here would leave it
+                    # queued, so the next turn on this RPC session reads
+                    # the stale event as its own end. Record the error
+                    # and keep draining until ``agent_end``.
+                    pending_error = call_error or stop
                 continue
 
             logger.debug("PiExecutor: ignoring event type=%s", event_type)

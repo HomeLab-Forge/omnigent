@@ -158,6 +158,42 @@ def test_trace_id_from_response_id_invalid_hex() -> None:
         telemetry.trace_id_from_response_id(bad_id)
 
 
+def test_completed_tool_call_uses_explicit_parent_and_stays_leaf(
+    in_memory_exporter: InMemorySpanExporter,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A deferred tool observation is a direct child of the supplied agent span."""
+    monkeypatch.setattr(telemetry, "_capture_content", True)
+    tracer = otel_trace.get_tracer("test")
+    with tracer.start_as_current_span("agent:watchdog") as parent:
+        traceparent = telemetry.traceparent_for_span(parent)
+    assert traceparent is not None
+
+    telemetry.record_completed_tool_call(
+        "session_checkpoint.load",
+        parent_traceparent=traceparent,
+        attributes={
+            "session.id": "conv_checkpoint",
+            "checkpoint.outcome": "success",
+        },
+        input_value={"session_id": "conv_checkpoint", "token": "secret"},
+        output_value={"checkpoint": {"status": "idle"}},
+    )
+
+    spans = list(in_memory_exporter.get_finished_spans())
+    assert [span.name for span in spans] == [
+        "agent:watchdog",
+        "tool:session_checkpoint.load",
+    ]
+    tool = spans[1]
+    assert tool.parent is not None
+    assert tool.parent.span_id == spans[0].context.span_id
+    assert tool.attributes["openinference.span.kind"] == "TOOL"
+    assert tool.attributes["gen_ai.operation.name"] == "execute_tool"
+    assert tool.attributes["session.id"] == "conv_checkpoint"
+    assert "[redacted]" in tool.attributes["input.value"]
+
+
 # ── _env_bool / should_capture_content ─────────────────
 
 
@@ -587,6 +623,23 @@ def test_tracing_context_stamps_session_id_on_agent_span(
     assert agent_spans[-1].attributes.get("session.id") == "d1f9214d74c38b9f9a9db17ed8352dc4"
 
 
+def test_traceparent_helpers_round_trip_span_context(
+    in_memory_exporter: InMemorySpanExporter,
+) -> None:
+    """A tool span serializes to one validated W3C traceparent."""
+    tracer = otel_trace.get_tracer("test")
+    span = tracer.start_span("tool")
+    try:
+        traceparent = telemetry.traceparent_for_span(span)
+        assert traceparent is not None
+        assert telemetry.normalize_traceparent(traceparent.upper()) == traceparent
+        assert traceparent.split("-")[1] == f"{span.get_span_context().trace_id:032x}"
+        assert traceparent.split("-")[2] == f"{span.get_span_context().span_id:016x}"
+        assert telemetry.normalize_traceparent("not-a-traceparent") is None
+    finally:
+        span.end()
+
+
 def test_set_session_id_stamps_current_span(
     in_memory_exporter: InMemorySpanExporter,
 ) -> None:
@@ -842,23 +895,29 @@ def test_inject_extract_frame_round_trip(
     in_memory_exporter: InMemorySpanExporter,
 ) -> None:
     """
-    A frame injected under a span and consumed via ``consume_frame_span``
-    nests under the same trace — the JSON-frame websocket propagation
-    invariant (host tunnel, session-updates) holds end to end.
+    A host frame propagates its parent without exporting a transport span.
     """
     tracer = otel_trace.get_tracer("test")
     with telemetry.trace_context_for_response(response_id=_RESP_ID):
-        with tracer.start_as_current_span("producer"):
+        with tracer.start_as_current_span("producer") as producer:
+            producer_span_id = producer.get_span_context().span_id
             frame = telemetry.inject_trace_context({"kind": "host.launch_runner"})
     assert "traceparent" in frame
 
     with telemetry.consume_frame_span("host.launch_runner", frame) as span:
         consumed_hex = format(span.get_span_context().trace_id, "032x")
+        with tracer.start_as_current_span("host-child"):
+            pass
 
     assert consumed_hex == _RESP_HEX, (
         f"consumer trace {consumed_hex!r} should match producer trace "
         f"{_RESP_HEX!r} — frame trace-context propagation is broken."
     )
+    spans = list(in_memory_exporter.get_finished_spans())
+    assert all(not exported.name.startswith("host.") for exported in spans)
+    child = next(exported for exported in spans if exported.name == "host-child")
+    assert child.parent is not None
+    assert child.parent.span_id == producer_span_id
 
 
 def test_inject_trace_context_noop_without_active_span() -> None:
@@ -880,7 +939,10 @@ def test_consume_frame_span_roots_new_trace_without_carrier(
     raising — a frame from a peer that never injected context is still
     handled, just without an upstream parent.
     """
-    with telemetry.consume_frame_span("host.hello", {"kind": "host.hello"}) as span:
+    with telemetry.consume_frame_span(
+        "session_updates.watch",
+        {"kind": "session_updates.watch"},
+    ) as span:
         assert span.get_span_context().trace_id != 0
 
 
@@ -894,8 +956,8 @@ def test_consume_frame_span_omits_payload_when_capture_off(
     """
     monkeypatch.setattr(telemetry, "_capture_content", False)
     with telemetry.consume_frame_span(
-        "host.launch_runner",
-        {"kind": "host.launch_runner", "workspace": "/tmp"},
+        "session_updates.watch",
+        {"kind": "session_updates.watch", "workspace": "/tmp"},
     ):
         pass
     span = in_memory_exporter.get_finished_spans()[-1]
@@ -913,9 +975,9 @@ def test_consume_frame_span_records_redacted_payload_when_capture_on(
     """
     monkeypatch.setattr(telemetry, "_capture_content", True)
     with telemetry.consume_frame_span(
-        "host.launch_runner",
+        "session_updates.watch",
         {
-            "kind": "host.launch_runner",
+            "kind": "session_updates.watch",
             "binding_token": "SUPER_SECRET",
             "workspace": "/tmp/ws",
             "traceparent": "00-abc-def-01",

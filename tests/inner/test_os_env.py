@@ -401,3 +401,61 @@ def test_shell_command_does_not_see_omnigent_project_root(
     out = result.get("stdout", "")
     assert project_entry in out
     assert str(_project_root()) not in out
+
+
+# ── A line limit is not a size limit ────────────────────────────────────────
+#
+# The 2,000-line default exists to stop a read saturating the context. Minified
+# files put the whole document on one line, so it bounds nothing: session
+# eec8f549 read a 382,882-character download back in a single call, well under
+# the line limit, and the next model call was refused.
+
+
+def _minified(tmp_path, size_bytes: int = 384_000):
+    path = tmp_path / "page.html"
+    path.write_text("<div>x</div>" * (size_bytes // 12), encoding="utf-8")
+    return path
+
+
+def test_one_enormous_line_is_capped(tmp_path) -> None:
+    from omnigent.inner.os_env import _MAX_TOOL_OUTPUT_CHARS, _read_impl
+
+    result = _read_impl(_minified(tmp_path), offset=1, limit=2_000, max_binary_bytes=None)
+    assert result["truncated"] is True
+    assert len(result["content"].encode("utf-8")) <= _MAX_TOOL_OUTPUT_CHARS
+
+
+def test_a_capped_read_reports_both_sizes(tmp_path) -> None:
+    from omnigent.inner.os_env import _read_impl
+
+    result = _read_impl(_minified(tmp_path), offset=1, limit=2_000, max_binary_bytes=None)
+    assert result["total_bytes"] > result["returned_bytes"]
+    assert result["returned_bytes"] == len(result["content"].encode("utf-8"))
+    assert "sys_os_shell" in result["note"]
+
+
+def test_returned_lines_reflects_what_was_sent(tmp_path) -> None:
+    """Not what was asked for — the caller needs the real number to page."""
+    from omnigent.inner.os_env import _read_impl
+
+    result = _read_impl(_minified(tmp_path), offset=1, limit=2_000, max_binary_bytes=None)
+    assert result["returned_lines"] == len(result["content"].splitlines())
+
+
+def test_ordinary_files_are_unaffected(tmp_path) -> None:
+    from omnigent.inner.os_env import _read_impl
+
+    path = tmp_path / "conf.yaml"
+    path.write_text("\n".join(f"KEY_{i}: value" for i in range(500)), encoding="utf-8")
+    result = _read_impl(path, offset=1, limit=2_000, max_binary_bytes=None)
+    assert "truncated" not in result
+    assert result["returned_lines"] == 500
+
+
+def test_the_cap_never_splits_a_utf8_character(tmp_path) -> None:
+    from omnigent.inner.os_env import _read_impl
+
+    path = tmp_path / "wide.txt"
+    path.write_text("héllo wörld " * 40_000, encoding="utf-8")
+    result = _read_impl(path, offset=1, limit=2_000, max_binary_bytes=None)
+    assert isinstance(result["content"], str)

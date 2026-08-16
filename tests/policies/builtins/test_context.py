@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from omnigent.policies.builtins.context import (
     _TASK_SWITCH_HISTORY_KEY,
+    _THRASHING_BATCH_KEY,
     _THRASHING_HISTORY_KEY,
     _looks_like_error,
     _strip_code_fences,
@@ -301,7 +304,7 @@ class TestLooksLikeError:
 class TestDetectThrashingPhases:
     def test_non_tool_result_phases_abstain(self) -> None:
         policy = detect_thrashing()
-        for phase in ("request", "tool_call", "response", "llm_request"):
+        for phase in ("tool_call", "response", "llm_request"):
             result = policy(_result_event("error", phase=phase))
             assert result is None, f"expected None for phase={phase}"
 
@@ -411,13 +414,28 @@ class TestDetectThrashingWindowRate:
         # Last 4 of [..., 0, 0, 1, 1] + [1] = [0, 1, 1, 1] = 75% → fires
         result = policy(_result_event("Error: x", history=[1, 1, 1, 0, 0, 1, 1]))
         assert result["result"] == "ASK"
-        assert "4 tool calls" in result["reason"]
+        assert "last 4 calls" in result["reason"]
 
 
 # ── rolling window ───────────────────────────────────────────────────────────
 
 
 class TestDetectThrashingWindow:
+    def test_request_resets_history(self) -> None:
+        policy = detect_thrashing(reset_on_request=True)
+        result = policy(
+            {
+                "type": "request",
+                "data": {"user_content": "continue"},
+                "session_state": {_THRASHING_HISTORY_KEY: [1, 1, 1]},
+            }
+        )
+
+        updates = {update["key"]: update["value"] for update in result["state_updates"]}
+        assert updates[_THRASHING_HISTORY_KEY] == []
+        # A new instruction also drops any round-trip left open by the last one.
+        assert updates[_THRASHING_BATCH_KEY] is None
+
     def test_window_slides(self) -> None:
         policy = detect_thrashing(window=3, consecutive_threshold=3)
         # keep = max(3, 3) = 3 → [1, 1, 1] + [0] → keep last 3 → [1, 1, 0]
@@ -453,6 +471,24 @@ class TestDetectThrashingAction:
 
 
 class TestDetectThrashingRobustness:
+    def test_long_shell_json_error_is_detected(self) -> None:
+        policy = detect_thrashing(consecutive_threshold=1, action="DENY")
+        result = policy(
+            _result_event(
+                json.dumps(
+                    {
+                        "stdout": "x" * 700,
+                        "stderr": "bad command",
+                        "exit_code": 128,
+                        "error": "command failed",
+                    }
+                )
+            )
+        )
+
+        assert result["result"] == "DENY"
+        assert "Loop guard" in result["reason"]
+
     def test_corrupted_history_resets_to_empty(self) -> None:
         policy = detect_thrashing(consecutive_threshold=2)
         event = {

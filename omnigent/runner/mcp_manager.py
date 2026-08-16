@@ -392,12 +392,47 @@ class RunnerMcpManager:
                 for ref in refs:
                     self._release_server_ref(ref.entry, entry.spec_hash)
 
+    @staticmethod
+    def _request_meta(
+        traceparent: str | None,
+        session_id: str | None,
+        agent: str | None,
+    ) -> dict[str, str] | None:
+        """Build the ``params._meta`` payload for one MCP tool call.
+
+        An MCP server sees one long-lived connection per runner and a
+        stream of calls over it. Connection headers come from static spec
+        config, so per-call identity has to travel here — the same channel
+        the trace context already uses.
+
+        Session and agent are what let a server keep per-session state
+        without inventing its own correlation. The homelab Oracle files
+        large fetches under ``<agent>-<session>/`` on that basis, so a
+        server that never reads these keys is unaffected and one that does
+        gets the same identity the trace carries.
+
+        :param traceparent: W3C context for the originating tool span.
+        :param session_id: Omnigent session id, e.g. ``"conv_abc123"``.
+        :param agent: Name of the agent spec making the call.
+        :returns: The metadata mapping, or ``None`` when nothing is known
+            — MCP omits ``_meta`` entirely rather than sending an empty
+            object.
+        """
+        meta = {
+            "traceparent": traceparent,
+            "omnigent-session-id": session_id,
+            "omnigent-agent": agent,
+        }
+        present = {key: value for key, value in meta.items() if value}
+        return present or None
+
     async def call_tool(
         self,
         spec: AgentSpec,
         tool_name: str,
         arguments: _JsonObject,
         session_id: str | None = None,
+        traceparent: str | None = None,
     ) -> str:
         """
         Dispatch *tool_name* against the pool's cached MCP session.
@@ -409,6 +444,7 @@ class RunnerMcpManager:
         :param session_id: Omnigent session id, e.g. ``"conv_abc123"``.
             Forwarded to the connection for inline elicitation
             context. ``None`` when no session is available.
+        :param traceparent: W3C context for the originating tool span.
         :returns: Tool result string.
         :raises McpElicitationRequired: When the MCP server returns
             an ``InputRequiredResult`` requiring user input before
@@ -467,6 +503,7 @@ class RunnerMcpManager:
                 bare_name,
                 arguments,
                 session_id=session_id,
+                meta=self._request_meta(traceparent, session_id, spec.name),
             )
         finally:
             if server_to_release is not None:

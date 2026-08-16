@@ -17,6 +17,7 @@ from typing import Annotated, Any, Literal, get_args
 from pydantic import BaseModel, ConfigDict, Field, Strict, field_validator, model_validator
 
 from omnigent.entities import ConversationItem
+from omnigent.runtime.session_checkpoint import SessionCheckpoint
 
 # ── Shared ──────────────────────────────────────────────────────
 
@@ -1529,6 +1530,21 @@ class SessionLabelsResponse(BaseModel):
 
     id: str
     labels: dict[str, str] = Field(default_factory=dict)
+
+
+class SessionCheckpointReplaceRequest(BaseModel):
+    """Replace only the framework checkpoint stored for a session."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    checkpoint: SessionCheckpoint | None = None
+
+
+class SessionCheckpointResponse(BaseModel):
+    """Framework checkpoint response without unrelated session state."""
+
+    session_id: str
+    checkpoint: SessionCheckpoint | None = None
 
 
 # Stages of a managed-sandbox launch, in pipeline order: the sandbox
@@ -3928,6 +3944,8 @@ class CompactionCompletedEvent(_SSEEventBase):
     summary: str | None = None
     summary_model: str | None = None
     compacted_messages: list[dict[str, Any]] | None = None
+    handover: dict[str, Any] | None = None
+    handover_loaded: bool = False
 
 
 class CompactionFailedEvent(_SSEEventBase):
@@ -4262,6 +4280,13 @@ def is_known_event(name: str) -> bool:
 # these internal markers. See ``designs/RUNNER_MESSAGE_INGEST.md`` Part B.
 
 
+class TraceContextEvent(_SSEEventBase):
+    """Runner-internal marker carrying the active agent span context."""
+
+    type: Literal["trace_context.available"]
+    traceparent: str
+
+
 class PolicyEvaluationRequestEvent(_SSEEventBase):
     """
     Runner-internal marker: harness requests policy evaluation.
@@ -4293,7 +4318,9 @@ class PolicyEvaluationRequestEvent(_SSEEventBase):
     data: dict[str, Any]
 
 
-HarnessStreamEvent = ServerStreamEvent | InjectionConsumedEvent | PolicyEvaluationRequestEvent
+HarnessStreamEvent = (
+    ServerStreamEvent | InjectionConsumedEvent | TraceContextEvent | PolicyEvaluationRequestEvent
+)
 
 
 # ── Projects ──────────────────────────────────────────────────────

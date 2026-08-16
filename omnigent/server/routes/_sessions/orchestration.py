@@ -1239,6 +1239,27 @@ def _accumulate_session_usage(
     new_current = conversation_store.increment_session_usage(session_id, delta)
     # Per-user daily rollup (policy-gated; this is the per-turn delta).
     _record_daily_cost(conv, cost_delta, conversation_store)
+
+    # Persist how full the window is, the same label the native-harness route
+    # writes. The GET snapshot serves it as ``last_total_tokens``, and the web
+    # client seeds its context display from that on load — so without it a
+    # session shows "No usage data yet" on every open until a turn completes in
+    # that page, however many turns it has already run. Executor-backed
+    # harnesses (pi, claude-sdk, codex) never reached the native route, so the
+    # label was written for no session on this path.
+    #
+    # context_tokens is the last call's total — how full the window is going
+    # into the next request. total_tokens sums a tool-loop turn's calls and
+    # would read high; it is the fallback only because single-call turns make
+    # the two equal.
+    context_tokens = usage_obj.get("context_tokens")
+    if not isinstance(context_tokens, int) or context_tokens <= 0:
+        context_tokens = total_tokens if isinstance(total_tokens, int) else 0
+    if context_tokens > 0:
+        conversation_store.set_labels(
+            session_id,
+            {_LAST_CONTEXT_TOKENS_LABEL_KEY: str(context_tokens)},
+        )
     return _priced_cost_for_display(new_current)
 
 
@@ -8063,6 +8084,13 @@ async def _handle_mcp_tools_call(
     arguments: dict[str, Any] = params.get("arguments") or {}
     request_state_str: str | None = params.get("requestState")
     input_responses: dict[str, Any] = params.get("inputResponses") or {}
+    from omnigent.runtime.telemetry import normalize_traceparent
+
+    raw_meta = params.get("_meta")
+    traceparent = normalize_traceparent(
+        raw_meta.get("traceparent") if isinstance(raw_meta, dict) else None
+    )
+    request_meta = {"traceparent": traceparent} if traceparent is not None else None
     is_retry = request_state_str is not None
 
     _logger.debug(
@@ -8292,7 +8320,11 @@ async def _handle_mcp_tools_call(
             f"/v1/sessions/{session_id}/mcp/execute",
             json={
                 "method": "tools/call",
-                "params": {"name": namespaced_name, "arguments": arguments},
+                "params": {
+                    "name": namespaced_name,
+                    "arguments": arguments,
+                    **({"_meta": request_meta} if request_meta is not None else {}),
+                },
             },
             # ``sys_session_send`` returns a launch handle immediately; this
             # timeout now protects ordinary runner proxy hangs.
@@ -8362,6 +8394,7 @@ async def _handle_mcp_tools_call(
                         "arguments": arguments,
                         "inputResponses": elicitation_responses,
                         "requestState": mcp_request_state,
+                        **({"_meta": request_meta} if request_meta is not None else {}),
                     },
                 },
                 timeout=MCP_PROXY_FORWARD_TIMEOUT_S,

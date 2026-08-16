@@ -58,6 +58,7 @@ from omnigent.model_override import (
     validate_model_override,
 )
 from omnigent.native_coding_agents import public_agent_name
+from omnigent.runner.skill_load_guard import skill_load_guard
 from omnigent.runtime import pending_elicitations
 from omnigent.session_lifecycle import (
     CLOSED_LABEL_KEY,
@@ -666,6 +667,13 @@ def get_arguments(event: _JsonObject) -> str:
     """Extract the arguments JSON string from an action_required event."""
     arguments = _event_item(event).get("arguments")
     return arguments if isinstance(arguments, str) else "{}"
+
+
+def get_traceparent(event: _JsonObject) -> str | None:
+    """Extract a validated W3C traceparent from an action_required event."""
+    from omnigent.runtime.telemetry import normalize_traceparent
+
+    return normalize_traceparent(_event_item(event).get("traceparent"))
 
 
 def should_dispatch_locally(tool_name: str) -> bool:
@@ -5027,6 +5035,7 @@ async def execute_tool(
     harness_client: httpx.AsyncClient | None = None,
     publish_event: Callable[[str, _JsonObject], None] | None = None,
     filesystem_registry: FilesystemRegistry | None = None,
+    traceparent: str | None = None,
 ) -> str:
     """
     Execute a tool and return the output string.
@@ -5050,6 +5059,7 @@ async def execute_tool(
         so that ``sys_os_write`` and ``sys_os_edit`` calls record changed
         paths for the ``GET …/changes`` endpoint. ``sys_os_shell`` is
         not tracked — shell side-effects cannot be attributed to a session.
+    :param traceparent: W3C context for the originating tool span.
     :returns: Tool output string.
     """
     if not arguments.strip():
@@ -5067,7 +5077,15 @@ async def execute_tool(
             # /mcp/execute. No runner-side policy gate needed.
             if agent_spec is None:
                 return "Error: agent_spec not available for MCP dispatch"
-            output = await mcp_manager.call_tool(agent_spec, tool_name, args)
+            if traceparent is None:
+                output = await mcp_manager.call_tool(agent_spec, tool_name, args)
+            else:
+                output = await mcp_manager.call_tool(
+                    agent_spec,
+                    tool_name,
+                    args,
+                    traceparent=traceparent,
+                )
         elif tool_name in _OS_ENV_TOOLS:
             output = await _execute_os_env_tool(
                 tool_name,
@@ -5229,6 +5247,8 @@ async def execute_tool(
                 args,
                 agent_spec=agent_spec,
                 runner_workspace=runner_workspace,
+                conversation_id=conversation_id,
+                task_id=task_id,
             )
         elif tool_name in _COMMENT_TOOLS:
             output = await _execute_comment_tool(
@@ -5362,6 +5382,7 @@ async def dispatch_tool_locally(
     session_async_tasks: dict[str, tuple[asyncio.Task[str], asyncio.Event]] | None = None,
     publish_event: Callable[[str, _JsonObject], None] | None = None,
     filesystem_registry: FilesystemRegistry | None = None,
+    traceparent: str | None = None,
 ) -> str:
     """Execute a tool locally and PATCH the result to the harness.
 
@@ -5383,6 +5404,7 @@ async def dispatch_tool_locally(
         for the ``GET …/changes`` endpoint.
     :param resource_registry: Optional session-resource registry used to
         observe tool-launched terminals.
+    :param traceparent: W3C context for the originating tool span.
     :returns: The tool output string.
     """
     output = await execute_tool(
@@ -5403,6 +5425,7 @@ async def dispatch_tool_locally(
         harness_client=harness_client,
         filesystem_registry=filesystem_registry,
         publish_event=publish_event,
+        traceparent=traceparent,
     )
 
     # A file-mutating tool just ran — nudge the web to refetch the
@@ -7118,6 +7141,8 @@ def _execute_skill_tool(
     *,
     agent_spec: AgentSpec | None,
     runner_workspace: Path | None,
+    conversation_id: str | None,
+    task_id: str | None,
 ) -> str:
     """
     Runner-local handler for ``load_skill`` and ``read_skill_file``.
@@ -7131,6 +7156,8 @@ def _execute_skill_tool(
     :param agent_spec: The session's AgentSpec.
     :param runner_workspace: The runner's workspace path for
         host-scope skill discovery.
+    :param conversation_id: Current conversation id.
+    :param task_id: Current response or task id.
     :returns: Tool output string.
     """
     from omnigent.tools.builtins.load_skill import LoadSkillTool
@@ -7143,6 +7170,15 @@ def _execute_skill_tool(
     # author valid agent configs via sys_os_write without requiring the
     # agent's own bundle to ship a skills/ directory.
     bundled_skills = _inject_orchestrator_skills(bundled_skills, agent_spec)
+
+    skill_name = args.get("name") if tool_name == "load_skill" else None
+    if isinstance(skill_name, str) and skill_load_guard.is_loaded(
+        conversation_id, task_id, skill_name
+    ):
+        return (
+            f"Skill {skill_name!r} is already loaded for this turn. "
+            "Follow its instructions now; do not call load_skill again."
+        )
 
     tool: Tool
     if tool_name == "load_skill":
@@ -7158,4 +7194,7 @@ def _execute_skill_tool(
     from omnigent.tools.base import ToolContext
 
     ctx = ToolContext(task_id="", conversation_id="", agent_id="")
-    return tool.invoke(arguments_json, ctx)
+    output = tool.invoke(arguments_json, ctx)
+    if isinstance(skill_name, str) and not output.startswith("Error:"):
+        skill_load_guard.record(conversation_id, task_id, skill_name)
+    return output

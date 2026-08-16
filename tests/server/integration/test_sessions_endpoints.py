@@ -4863,6 +4863,64 @@ async def test_accumulate_session_usage_prices_from_usage_model(
     assert usage.get("total_cost_usd") == pytest.approx(0.002)
 
 
+async def test_accumulate_session_usage_records_the_context_tokens_label(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """An executor turn leaves the context-tokens label the GET snapshot reads.
+
+    The web client seeds its context display from ``last_total_tokens`` on load.
+    That comes from a label only the native-harness usage route used to write,
+    so an executor-backed session (pi, claude-sdk, codex) reported "No usage
+    data yet" on every open no matter how many turns it had run.
+    """
+    from omnigent.server.routes import sessions as sessions_routes
+
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+
+    sessions_routes._accumulate_session_usage(
+        {"usage": {"input_tokens": 1000, "output_tokens": 500, "total_tokens": 1500}},
+        session["id"],
+        SqlAlchemyConversationStore(db_uri),
+    )
+
+    fetched = await client.get(f"/v1/sessions/{session['id']}")
+    assert fetched.json()["last_total_tokens"] == 1500
+
+
+async def test_accumulate_session_usage_label_prefers_context_tokens(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """``context_tokens`` wins over the summed total on a tool-loop turn.
+
+    ``total_tokens`` sums every call in the turn, so a tool loop that re-sends
+    its history would report a window far fuller than it is. ``context_tokens``
+    is the last call's total, which is what the next request actually carries.
+    """
+    from omnigent.server.routes import sessions as sessions_routes
+
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+
+    sessions_routes._accumulate_session_usage(
+        {
+            "usage": {
+                "input_tokens": 9000,
+                "output_tokens": 900,
+                "total_tokens": 9900,
+                "context_tokens": 4200,
+            }
+        },
+        session["id"],
+        SqlAlchemyConversationStore(db_uri),
+    )
+
+    fetched = await client.get(f"/v1/sessions/{session['id']}")
+    assert fetched.json()["last_total_tokens"] == 4200
+
+
 async def test_accumulate_session_usage_prefers_provider_cost(
     client: httpx.AsyncClient,
     db_uri: str,

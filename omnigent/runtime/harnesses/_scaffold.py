@@ -100,6 +100,15 @@ _SHUTDOWN_GRACE_S = 4.5
 # (DENY), advisory LLM/TOOL_RESULT phases fail OPEN (ALLOW).
 _POLICY_EVAL_TIMEOUT_S = 86400.0
 
+# Stable, client-visible error code for a turn-context desync (the inner SDK
+# generation outlived its turn — an orphaned tool/policy callback, or a turn
+# torn down on a dead harness channel). Deliberately ABSENT from AP's
+# retryable-harness-error allowlist so the L2 retry classifier treats it as
+# terminal rather than retry-looping into the same wedge. Mirrors the runner's
+# ``_RUNNER_TURN_CONTEXT_DESYNC_CODE`` and the harness adapter's orphaned-
+# callback safe-fail ``code``.
+_TURN_CONTEXT_DESYNC_CODE = "runner_turn_context_desync"
+
 # Per-turn IDLE watchdog: max gap WITHOUT progress before a wedged
 # ``run_turn`` becomes ``response.failed`` (vs heartbeating forever).
 # Every non-heartbeat ``ctx.emit`` resets the deadline (see
@@ -378,6 +387,8 @@ class TurnContext:
         e.g. ``"resp_abc123"``. Surfaced on the SSE
         ``response.created`` envelope so Omnigent can correlate
         replays / heartbeat-event-seq tracking.
+    :param conversation_id: Omnigent conversation id from the
+        session route, e.g. ``"conv_abc123"``.
     :param event_queue: The :class:`asyncio.Queue` the SSE
         streaming response reads from. ``ctx.emit`` puts
         events onto this queue; the streaming response
@@ -393,8 +404,10 @@ class TurnContext:
         response_id: str,
         event_queue: asyncio.Queue[HarnessStreamEvent | None],
         cancelled: asyncio.Event,
+        conversation_id: str | None = None,
     ) -> None:
         self.response_id = response_id
+        self.conversation_id = conversation_id
         self._event_queue = event_queue
         self.cancelled = cancelled
         # Layer 3 per-tool-dispatch state: ``call_id`` →
@@ -428,6 +441,11 @@ class TurnContext:
         # ``None`` disables it (watchdog off, or outside a guarded run).
         self._reset_idle_watchdog: Callable[[], None] | None = None
 
+    def mark_progress(self) -> None:
+        """Push the idle-watchdog deadline forward without emitting SSE."""
+        if self._reset_idle_watchdog is not None:
+            self._reset_idle_watchdog()
+
     def emit(self, event: HarnessStreamEvent) -> None:
         """
         Push an SSE event upstream.
@@ -448,11 +466,18 @@ class TurnContext:
         # progress — letting them reset the deadline would defeat the
         # watchdog (a wedged turn's 15s heartbeats would keep it alive
         # forever).
-        if self._reset_idle_watchdog is not None and not isinstance(event, HeartbeatEvent):
-            self._reset_idle_watchdog()
+        if not isinstance(event, HeartbeatEvent):
+            self.mark_progress()
         self._event_queue.put_nowait(event)
 
-    async def dispatch_tool(self, call_id: str, name: str, arguments: str, agent: str) -> str:
+    async def dispatch_tool(
+        self,
+        call_id: str,
+        name: str,
+        arguments: str,
+        agent: str,
+        traceparent: str | None = None,
+    ) -> str:
         """
         Emit a server-dispatched tool call and park until the result.
 
@@ -474,6 +499,8 @@ class TurnContext:
         :param agent: Agent name that invoked the tool — required
             on the function_call item per
             :class:`omnigent.entities.conversation.FunctionCallData`.
+        :param traceparent: W3C context for the active tool span. The runner
+            forwards it through MCP request metadata.
         :returns: The tool's output string from
             :class:`omnigent.server.schemas.ToolResult`.
         :raises asyncio.CancelledError: If the turn is cancelled
@@ -495,6 +522,8 @@ class TurnContext:
             "call_id": call_id,
             "agent": agent,
         }
+        if traceparent is not None:
+            item["traceparent"] = traceparent
         self.emit(OutputItemDoneEvent(type="response.output_item.done", item=item))
         try:
             result = await future
@@ -849,6 +878,16 @@ class HarnessApp:
         """
         from omnigent.server.schemas import ErrorDetail
 
+        # P2.11: a turn-context desync (the inner generation outlived its turn)
+        # carries the stable ``runner_turn_context_desync`` code. Surface it
+        # verbatim — it is intentionally absent from AP's retryable-harness-
+        # error allowlist, so the L2 classifier treats it as terminal instead
+        # of retry-looping into the same wedge. Keyed off the exception's
+        # ``code`` attribute so a harness-side raise (vs. the class name) maps
+        # consistently.
+        if getattr(exception, "code", None) == _TURN_CONTEXT_DESYNC_CODE:
+            return ErrorDetail(code=_TURN_CONTEXT_DESYNC_CODE, message=str(exception))
+
         return ErrorDetail(code=type(exception).__name__, message=str(exception))
 
     def build(self) -> FastAPI:
@@ -1113,7 +1152,10 @@ class HarnessApp:
             return denied
         self._check_conversation_id(request, conversation_id)
         if isinstance(body, MessageEvent):
-            return await self._start_or_inject_turn(body.to_create_request())
+            return await self._start_or_inject_turn(
+                body.to_create_request(),
+                conversation_id=conversation_id,
+            )
         if isinstance(body, InterruptEvent):
             return await self._handle_interrupt_event()
         if isinstance(body, ToolResultEvent):
@@ -1202,7 +1244,10 @@ class HarnessApp:
         return Response(status_code=status.HTTP_204_NO_CONTENT)
 
     async def _start_or_inject_turn(
-        self, request: CreateResponseRequest
+        self,
+        request: CreateResponseRequest,
+        *,
+        conversation_id: str | None = None,
     ) -> StreamingResponse | Response:
         """
         Start a new turn or inject into the in-flight one.
@@ -1220,6 +1265,7 @@ class HarnessApp:
            that runs ``run_turn`` to completion.
 
         :param request: The decoded request body.
+        :param conversation_id: Omnigent conversation id from the route.
         :returns: Either a :class:`StreamingResponse` for the new
             turn or a 204 :class:`Response` for an in-band
             injection.
@@ -1268,6 +1314,7 @@ class HarnessApp:
                 response_id=response_id,
                 event_queue=event_queue,
                 cancelled=cancelled,
+                conversation_id=conversation_id,
             )
             self._in_flight[response_id] = ctx
             self._active_turn_ctx = ctx

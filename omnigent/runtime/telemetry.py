@@ -30,6 +30,7 @@ concerns:
 from __future__ import annotations
 
 import contextvars
+import json
 import logging
 import os
 import re
@@ -49,6 +50,9 @@ _logger = logging.getLogger(__name__)
 
 _RESP_PREFIX = "resp_"
 _HEX_LEN = 32
+_TRACEPARENT_RE = re.compile(
+    r"^00-(?P<trace_id>[0-9a-f]{32})-(?P<span_id>[0-9a-f]{16})-(?P<flags>[0-9a-f]{2})$"
+)
 # Sentinel span ID used in trace_context_for_response. start_agent_span
 # detects this value and strips the parent so the agent span is exported
 # as a true root span (parent_span_id absent in OTLP proto).
@@ -58,6 +62,26 @@ _capture_content: bool = False
 _initialized: bool = False
 _metrics_initialized: bool = False
 _logs_initialized: bool = False
+
+
+def normalize_traceparent(value: object) -> str | None:
+    """Return a canonical W3C traceparent, or ``None`` when invalid."""
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip().lower()
+    return normalized if _TRACEPARENT_RE.fullmatch(normalized) else None
+
+
+def traceparent_for_span(span: Span | None) -> str | None:
+    """Serialize a recording span's context as a W3C traceparent."""
+    if span is None:
+        return None
+    context = span.get_span_context()
+    if context is None or not context.is_valid:
+        return None
+    flags = int(context.trace_flags) & 0xFF
+    return f"00-{context.trace_id:032x}-{context.span_id:016x}-{flags:02x}"
+
 
 # Session (conversation) id for the current execution context. Set once at a
 # session boundary (request hook, executor turn, forwarder task); the
@@ -130,6 +154,15 @@ _REDACT_KEY_SUBSTRINGS = (
     "api_key",
     "apikey",
 )
+_SECRET_VALUE_RE = r'(?:"[^"]*"|\'[^\']*\'|[^\s&,;]+)'
+_SECRET_ASSIGNMENT_RE = re.compile(
+    rf"(?i)\b(?P<key>{'|'.join(_REDACT_KEY_SUBSTRINGS)})\s*=\s*(?P<value>{_SECRET_VALUE_RE})"
+)
+_SECRET_QUERY_RE = re.compile(
+    rf"(?i)(?P<prefix>[?&](?:{'|'.join(_REDACT_KEY_SUBSTRINGS)})=)(?P<value>[^&#\s]+)"
+)
+_URL_USERINFO_RE = re.compile(r"(?i)(https?://)[^/@\s]+@")
+_BEARER_RE = re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]+")
 
 
 def _redact_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
@@ -162,16 +195,50 @@ def _payload_to_attribute(payload: Mapping[str, Any]) -> str:
     :param payload: The message dict to record.
     :returns: A JSON string, truncated to :data:`_CONTENT_MAX_LEN`.
     """
-    import json
+    return redact_and_cap_payload(_redact_payload(payload), _CONTENT_MAX_LEN)
 
-    redacted = _redact_payload(payload)
+
+def redact_and_cap_text(value: Any, max_length: int = _CONTENT_MAX_LEN) -> str:
+    """Redact secret-bearing text and cap the retained string."""
+    text = value if isinstance(value, str) else str(value)
+    text = _SECRET_ASSIGNMENT_RE.sub(r"\g<key>=[redacted]", text)
+    text = _SECRET_QUERY_RE.sub(r"\g<prefix>[redacted]", text)
+    text = _URL_USERINFO_RE.sub(r"\1[redacted]@", text)
+    text = _BEARER_RE.sub("Bearer [redacted]", text)
+    suffix = "…[truncated]"
+    return text if len(text) <= max_length else text[: max_length - len(suffix)] + suffix
+
+
+def redact_and_cap_payload(payload: Any, max_length: int = _CONTENT_MAX_LEN) -> str:
+    """Serialize arbitrary payload content after recursive secret redaction."""
+
+    def _redact(value: Any, key: str | None = None) -> Any:
+        if key is not None and any(token in key.lower() for token in _REDACT_KEY_SUBSTRINGS):
+            return "[redacted]"
+        if isinstance(value, Mapping):
+            return {
+                str(child_key): _redact(child, str(child_key))
+                for child_key, child in value.items()
+            }
+        if isinstance(value, list):
+            return [_redact(child) for child in value]
+        if isinstance(value, tuple):
+            return [_redact(child) for child in value]
+        if isinstance(value, str):
+            return redact_and_cap_text(value, max_length)
+        return value
+
+    candidate = payload
+    if isinstance(payload, str):
+        try:
+            candidate = json.loads(payload)
+        except (TypeError, ValueError):
+            candidate = payload
     try:
-        text = json.dumps(redacted, default=str)
+        text = json.dumps(_redact(candidate), default=str, sort_keys=True)
     except (TypeError, ValueError):
-        text = str(redacted)
-    if len(text) > _CONTENT_MAX_LEN:
-        text = text[:_CONTENT_MAX_LEN] + "…[truncated]"
-    return text
+        text = str(_redact(candidate))
+    return redact_and_cap_text(text, max_length)
 
 
 def record_message_payload(
@@ -594,6 +661,7 @@ _GEN_AI_OUTPUT_TOKENS = "gen_ai.usage.output_tokens"
 _GEN_AI_TOTAL_TOKENS = "gen_ai.usage.total_tokens"
 _GEN_AI_CACHE_READ_TOKENS = "gen_ai.usage.cache_read_input_tokens"
 _GEN_AI_CACHE_CREATION_TOKENS = "gen_ai.usage.cache_creation_input_tokens"
+_LANGFUSE_USAGE_DETAILS = "langfuse.observation.usage_details"
 
 
 def record_llm_usage(span: Span, usage: dict[str, Any]) -> None:
@@ -622,12 +690,29 @@ def record_llm_usage(span: Span, usage: dict[str, Any]) -> None:
     span.set_attribute(_GEN_AI_INPUT_TOKENS, input_tokens)
     span.set_attribute(_GEN_AI_OUTPUT_TOKENS, output_tokens)
     span.set_attribute(_GEN_AI_TOTAL_TOKENS, int(total))
+    usage_details = {
+        "input": input_tokens,
+        "output": output_tokens,
+        "total": int(total),
+    }
     if "cache_read_input_tokens" in usage:
-        span.set_attribute(_GEN_AI_CACHE_READ_TOKENS, int(usage["cache_read_input_tokens"]))
+        cache_read = int(usage["cache_read_input_tokens"])
+        span.set_attribute(_GEN_AI_CACHE_READ_TOKENS, cache_read)
+        usage_details["cache_read_input_tokens"] = cache_read
     if "cache_creation_input_tokens" in usage:
+        cache_creation = int(usage["cache_creation_input_tokens"])
         span.set_attribute(
-            _GEN_AI_CACHE_CREATION_TOKENS, int(usage["cache_creation_input_tokens"])
+            _GEN_AI_CACHE_CREATION_TOKENS,
+            cache_creation,
         )
+        usage_details["cache_creation_input_tokens"] = cache_creation
+    # Omnigent usage buckets are already mutually exclusive. Langfuse's explicit
+    # JSON attribute preserves those values instead of re-normalizing gen_ai.*
+    # fields as provider-inclusive counts.
+    span.set_attribute(
+        _LANGFUSE_USAGE_DETAILS,
+        json.dumps(usage_details, separators=(",", ":"), sort_keys=True),
+    )
 
 
 def record_error(span: Span, exc: BaseException) -> None:
@@ -648,6 +733,60 @@ def record_error(span: Span, exc: BaseException) -> None:
     span.set_attribute("error.type", type(exc).__name__)
     span.set_attribute("error.message", str(exc))
     span.record_exception(exc)
+
+
+def record_completed_tool_call(
+    tool_name: str,
+    *,
+    parent_traceparent: str,
+    attributes: Mapping[str, Any] | None = None,
+    input_value: Any = None,
+    output_value: Any = None,
+    error_type: str | None = None,
+    error_message: str | None = None,
+) -> None:
+    """Record a completed TOOL leaf under an explicit remote parent span."""
+    if not telemetry_enabled():
+        return
+    normalized = normalize_traceparent(parent_traceparent)
+    if normalized is None:
+        return
+
+    from opentelemetry import trace as otel_trace
+    from opentelemetry.trace import StatusCode
+    from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapPropagator
+
+    parent = TraceContextTextMapPropagator().extract({"traceparent": normalized})
+    span_attributes: dict[str, Any] = {
+        "openinference.span.kind": "TOOL",
+        "openinference.tool.name": tool_name,
+        "tool.name": tool_name,
+        "gen_ai.tool.name": tool_name,
+        "gen_ai.operation.name": "execute_tool",
+    }
+    span_attributes.update(attributes or {})
+    span = otel_trace.get_tracer("omnigent").start_span(
+        name=f"tool:{tool_name}",
+        context=parent,
+        attributes=span_attributes,
+    )
+    try:
+        if should_capture_content() and input_value is not None:
+            span.set_attribute("input.value", redact_and_cap_payload(input_value))
+        if should_capture_content() and output_value is not None:
+            span.set_attribute("output.value", redact_and_cap_payload(output_value))
+        if error_type is not None:
+            span.set_attribute("error.type", error_type)
+            if should_capture_content() and error_message:
+                safe_message = redact_and_cap_text(error_message)
+                span.set_attribute("error.message", safe_message)
+                span.set_status(StatusCode.ERROR, safe_message)
+            else:
+                span.set_status(StatusCode.ERROR)
+        else:
+            span.set_status(StatusCode.OK)
+    finally:
+        span.end()
 
 
 def record_cancellation(span: Span) -> None:
@@ -749,13 +888,13 @@ def consume_frame_span(
     attributes: Mapping[str, Any] | None = None,
 ) -> Iterator[Any]:
     """
-    Open a CONSUMER span parented on a received frame's trace context.
+    Consume a frame under its received trace context.
 
     The receive-side wrapper for the JSON-frame websockets: extracts the
-    W3C context that :func:`inject_trace_context` wrote into ``carrier``,
-    then opens a span that nests under the sender's trace. Any frame
-    encoded while this span is active (e.g. a result frame sent back in
-    reply) inherits it, so request/response round trips stay linked.
+    W3C context that :func:`inject_trace_context` wrote into ``carrier``.
+    Host control frames attach that context without exporting a ``host.*``
+    span. Other frames open a CONSUMER span. Replies and child work inherit
+    the received context in both cases.
 
     :param name: Span name, e.g. ``"host.launch_runner"``.
     :param carrier: The decoded inbound frame (a JSON dict) that may
@@ -764,6 +903,18 @@ def consume_frame_span(
         ``{"host.request_id": "req_1"}``.
     :returns: A context manager yielding the started span.
     """
+    parent = extract_trace_context(carrier)
+    if name.startswith("host."):
+        from opentelemetry import context as otel_context
+        from opentelemetry import trace as otel_trace
+
+        token = otel_context.attach(parent)
+        try:
+            yield otel_trace.get_current_span()
+        finally:
+            otel_context.detach(token)
+        return
+
     if not telemetry_enabled():
         from opentelemetry.trace import INVALID_SPAN
 
@@ -771,7 +922,6 @@ def consume_frame_span(
         return
     from opentelemetry import trace as otel_trace
 
-    parent = extract_trace_context(carrier)
     tracer = otel_trace.get_tracer("omnigent.frames")
     with tracer.start_as_current_span(
         name,

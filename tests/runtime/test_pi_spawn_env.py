@@ -11,11 +11,14 @@ This is a unit test — no subprocess spawn, no real pi CLI.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
+import yaml
 
 from omnigent.runtime.workflow import _build_pi_spawn_env
+from omnigent.spec.parser import parse
 from omnigent.spec.types import AgentSpec, ExecutorSpec, LLMConfig
 
 
@@ -36,7 +39,12 @@ def _isolate_global_config(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> N
     )
 
 
-def _make_spec(*, model: str | None = None, profile: str | None = None) -> AgentSpec:
+def _make_spec(
+    *,
+    model: str | None = None,
+    profile: str | None = None,
+    smart_compaction: dict[str, object] | None = None,
+) -> AgentSpec:
     """
     Build a minimal pi :class:`AgentSpec` for spawn-env tests.
 
@@ -52,6 +60,8 @@ def _make_spec(*, model: str | None = None, profile: str | None = None) -> Agent
         config["model"] = model
     if profile is not None:
         config["profile"] = profile
+    if smart_compaction is not None:
+        config["smart_compaction"] = smart_compaction
     return AgentSpec(
         spec_version=1,
         name="test-pi",
@@ -77,6 +87,46 @@ def test_pi_spawn_env_threads_cwd_separately_from_bundle_dir(tmp_path: Path) -> 
 
     assert env["HARNESS_PI_CWD"] == str(workspace)
     assert env["HARNESS_PI_BUNDLE_DIR"] == str(bundle_dir)
+
+
+def test_pi_spawn_env_serializes_smart_compaction_config() -> None:
+    env = _build_pi_spawn_env(
+        _make_spec(
+            smart_compaction={
+                "enabled": True,
+                "trigger_tokens": 56000,
+                "handover_max_tokens": 4096,
+            }
+        )
+    )
+
+    assert env["HARNESS_PI_SMART_COMPACTION"] == (
+        '{"enabled": true, "handover_max_tokens": 4096, "trigger_tokens": 56000}'
+    )
+
+
+def test_pi_spawn_env_preserves_smart_compaction_from_yaml(tmp_path: Path) -> None:
+    config = {
+        "spec_version": 1,
+        "executor": {
+            "type": "omnigent",
+            "config": {
+                "harness": "pi",
+                "smart_compaction": {
+                    "enabled": True,
+                    "trigger_tokens": 56000,
+                },
+            },
+        },
+    }
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+
+    env = _build_pi_spawn_env(parse(tmp_path))
+
+    assert json.loads(env["HARNESS_PI_SMART_COMPACTION"]) == {
+        "enabled": True,
+        "trigger_tokens": 56000,
+    }
 
 
 def _ucode_state_for_pi(

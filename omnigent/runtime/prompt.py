@@ -16,6 +16,71 @@ from omnigent.entities import (
 )
 from omnigent.spec import AgentSpec
 
+PI_AGENT_COMPLETION_INSTRUCTION = (
+    "Work autonomously until the user's request is resolved. Use tools when they "
+    "can establish facts or complete work. Do not stop at intermediate progress, "
+    "raw tool output, or uncertainty. Progress means new evidence, changed state, "
+    "or completed work. Classify a retry before making it: deterministic failures "
+    "need a different approach, transient failures need a declared maximum attempt "
+    "count, and dependent running work needs a declared deadline and polling interval. "
+    "Do not switch tools merely to evade a failure. If a Loop guard denial appears, "
+    "make no more tool calls. Use the one final response for an incomplete-stop "
+    "handoff covering Done, Intended next, Stopped because, and Need from you."
+)
+
+PI_TOOL_TURN_CONTINUATION = (
+    "The prior model step ended before task closure. Continue from the tool results "
+    "only when the next action advances the task. Honor any declared retry count, "
+    "deadline, polling interval, and maximum polls. Do not repeat a successful call, "
+    "retry a deterministic failure unchanged, or switch tool categories merely to "
+    "keep acting. Finish the request, or provide the incomplete-stop handoff when the "
+    "declared boundary is exhausted."
+)
+
+PI_PRINTED_TOOL_RECOVERY = (
+    "Your previous response printed a tool invocation instead of making a protocol call. "
+    "Invoke the registered tool `{tool_name}` now. Do not describe, quote, or fence the call. "
+    "Use the supplied tool schema and continue the task from its result."
+)
+
+# A model that printed once usually printed because it guessed the argument
+# names. The retry restates the accepted arguments so the second attempt has
+# the schema in front of it rather than in the tool list far above.
+PI_PRINTED_TOOL_RECOVERY_WITH_SCHEMA = (
+    "Your previous response printed a tool invocation instead of making a protocol call. "
+    "Invoke the registered tool `{tool_name}` now. Do not describe, quote, or fence the call. "
+    "Its accepted arguments are: {tool_arguments}. "
+    "Emit a protocol tool call with those argument names and continue from its result."
+)
+
+# Sent when every recovery attempt still came back as printed text. The turn
+# ends without work, so the response says that plainly instead of leaving the
+# printed invocation to look like a result.
+PI_PRINTED_TOOL_EXHAUSTED_RESPONSE = (
+    "Done: nothing — I could not invoke tools on this turn.\n"
+    "Intended next: call the registered tool as a protocol call and continue the task.\n"
+    "Stopped because: my replies printed the tool invocation as text instead of "
+    "calling it, through every retry.\n"
+    "Need from you: resend the request to start a clean turn."
+)
+
+# Progress note carried into the handover when a restart follows a turn Pi
+# abandoned after its tool calls, rather than one it compacted on purpose.
+PI_TOOL_TURN_WEDGED_SUMMARY = (
+    "The previous process stopped answering after its tool calls and was restarted. "
+    "The tool results it produced are recorded in the session; nothing after them is known."
+)
+
+# The turn's response when the restart above did not bring Pi back either. The
+# turn ends with a handoff so the session stays usable.
+PI_TOOL_TURN_WEDGED_RESPONSE = (
+    "Done: the tool calls recorded on this turn.\n"
+    "Intended next: continue from those results.\n"
+    "Stopped because: I stopped answering after my tool calls, and a restart did "
+    "not recover the turn.\n"
+    "Need from you: send the next message — the tool results are kept."
+)
+
 
 def append_framework_instructions(
     instructions: str | None,

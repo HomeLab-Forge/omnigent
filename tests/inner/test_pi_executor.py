@@ -6,6 +6,7 @@ import logging
 import os
 import shutil
 import socket
+import subprocess
 import tempfile
 import textwrap
 import unittest
@@ -16,10 +17,15 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from omnigent.inner import pi_executor
 from omnigent.inner.databricks_executor import DatabricksCredentials
 from omnigent.inner.executor import (
+    CompactionComplete,
     ExecutorConfig,
     ExecutorError,
+    ExecutorProgress,
+    LLMCallComplete,
+    LLMCallStarted,
     ReasoningChunk,
     TextChunk,
     ToolCallComplete,
@@ -29,11 +35,17 @@ from omnigent.inner.executor import (
 )
 from omnigent.inner.pi_executor import (
     PiExecutor,
+    SmartCompactionConfig,
     _build_models_json,
     _databricks_model_wire_catalog,
     _generate_extension_js,
+    _generate_handover_extension_js,
+    _handover_from_compaction,
     _pi_provider_for_model,
     _PiRpcSession,
+    _printed_tool_arguments,
+    _printed_tool_recovery_prompt,
+    _printed_tool_target,
     _redact_argv_for_log,
     _safe_dumps,
     _sanitize_schema,
@@ -43,6 +55,7 @@ from omnigent.inner.pi_executor import (
 from omnigent.model_catalog import ModelEntry
 from omnigent.model_metadata import ModelMetadata, ModelWireAPI
 from omnigent.runtime.harnesses._scaffold import PolicyVerdictPayload
+from omnigent.runtime.prompt import PI_TOOL_TURN_WEDGED_RESPONSE
 
 
 def _run(coro):
@@ -728,6 +741,155 @@ class TestGenerateExtensionJs(unittest.TestCase):
         # block verdict is honored.
         self.assertIn('kind: "policy_eval"', js)
         self.assertIn("block: true", js)
+
+
+def test_generate_handover_extension_uses_tools_disabled_completion() -> None:
+    js = _generate_handover_extension_js(
+        SmartCompactionConfig(
+            enabled=True,
+            trigger_tokens=56000,
+            handover_max_tokens=4096,
+            source_max_chars=280000,
+        )
+    )
+
+    assert 'pi.on("session_before_compact"' in js
+    assert "ctx.modelRegistry.complete" in js
+    assert "registerTool" not in js
+    assert "handoverMaxTokens" in js
+    assert "__omnigent_handover_v1__" in js
+
+
+def test_handover_compaction_details_validate_structured_state() -> None:
+    result = {
+        "summary": "structured",
+        "details": {
+            "type": "omnigent_session_handover",
+            "draft": {
+                "original_directive": "model copy",
+                "objective": "Finish the task.",
+                "phase": "validate",
+                "completed_outcomes": ["Edited the runtime."],
+                "verified_facts": [],
+                "validations": [],
+                "failed_approaches": [],
+                "decisions": [],
+                "remaining_work": ["Run tests."],
+                "next_action": "Run tests.",
+                "theories": [],
+                "do_not_repeat": ["Do not repeat the edit."],
+                "blockers": [],
+                "user_questions": [],
+                "active_waits": [],
+                "evidence_refs": [],
+                "loaded_skills": [],
+            },
+        },
+    }
+
+    handover = _handover_from_compaction(
+        result=result,
+        original_directive="Exact directive.",
+        repository_state=None,
+        context_tokens=56000,
+    )
+
+    assert handover.mode == "structured"
+    assert handover.original_directive == "Exact directive."
+    assert handover.next_action == "Run tests."
+    assert handover.context_tokens == 56000
+
+
+def test_generated_handover_extension_returns_structured_compaction(
+    tmp_path: Path,
+) -> None:
+    node_path = shutil.which("node")
+    if node_path is None:
+        pytest.skip("node is required for generated Pi handover extension tests")
+
+    extension_path = tmp_path / "omnigent_handover.js"
+    runner_path = tmp_path / "run_handover.js"
+    extension_path.write_text(
+        _generate_handover_extension_js(SmartCompactionConfig(enabled=True, trigger_tokens=56000)),
+        encoding="utf-8",
+    )
+    draft = {
+        "original_directive": "model copy",
+        "objective": "Finish the task.",
+        "phase": "validate",
+        "completed_outcomes": [],
+        "verified_facts": [],
+        "validations": [],
+        "failed_approaches": [],
+        "decisions": [],
+        "remaining_work": ["Run tests."],
+        "next_action": "Run tests.",
+        "theories": [],
+        "do_not_repeat": [],
+        "blockers": [],
+        "user_questions": [],
+        "active_waits": [],
+        "evidence_refs": [],
+        "loaded_skills": [],
+    }
+    runner_path.write_text(
+        textwrap.dedent(
+            f"""
+            const extension = require(process.argv[2]);
+            let handler;
+            extension({{
+              on(event, fn) {{
+                if (event === "session_before_compact") handler = fn;
+              }}
+            }});
+
+            (async () => {{
+              const result = await handler(
+                {{
+                  customInstructions: "OMNIGENT_STRUCTURED_HANDOVER_V1\\n"
+                    + JSON.stringify({{ original_directive: "Exact directive." }}),
+                  branchEntries: [
+                    {{
+                      type: "message",
+                      message: {{ role: "user", content: "Exact directive." }}
+                    }}
+                  ],
+                  preparation: {{ tokensBefore: 56000 }},
+                  signal: new AbortController().signal
+                }},
+                {{
+                  model: {{ provider: "mock", id: "mock-model" }},
+                  modelRegistry: {{
+                    complete: async () => ({{
+                      content: [{{ type: "text", text: {json.dumps(json.dumps(draft))} }}],
+                      usage: {{ input: 10, output: 5, totalTokens: 15 }}
+                    }})
+                  }}
+                }}
+              );
+              process.stdout.write(JSON.stringify(result));
+            }})().catch((error) => {{
+              process.stderr.write(error && error.stack ? error.stack : String(error));
+              process.exit(1);
+            }});
+            """
+        ),
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [node_path, str(runner_path), str(extension_path)],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    payload = json.loads(result.stdout)
+
+    compaction = payload["compaction"]
+    assert compaction["firstKeptEntryId"] == "__omnigent_handover_v1__"
+    assert compaction["details"]["type"] == "omnigent_session_handover"
+    assert compaction["details"]["draft"]["original_directive"] == "Exact directive."
 
 
 # ---------------------------------------------------------------------------
@@ -1697,6 +1859,29 @@ class TestBuildEnvAndDir(unittest.TestCase):
             shutil.rmtree(config.tmp_dir, ignore_errors=True)
 
 
+def test_smart_compaction_adds_handover_extension_without_tools() -> None:
+    with patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"):
+        executor = PiExecutor(
+            smart_compaction=SmartCompactionConfig(
+                enabled=True,
+                trigger_tokens=56000,
+            )
+        )
+
+    config = executor._build_env_and_dir([], None, None, None)
+    try:
+        extension_paths = [
+            config.extra_args[index + 1]
+            for index, value in enumerate(config.extra_args)
+            if value == "--extension"
+        ]
+        assert len(extension_paths) == 1
+        content = Path(extension_paths[0]).read_text(encoding="utf-8")
+        assert 'pi.on("session_before_compact"' in content
+    finally:
+        shutil.rmtree(config.tmp_dir, ignore_errors=True)
+
+
 def test_gateway_seeds_managed_settings_from_global_agent(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1844,6 +2029,57 @@ def test_pi_tools_arg_skips_unnamed_entries() -> None:
 # ---------------------------------------------------------------------------
 
 
+def test_printed_tool_target_recognizes_exact_and_legacy_invocations() -> None:
+    tool_names = ("load_skill", "sys_os_read", "oracle__search")
+
+    assert _printed_tool_target('sys_os_read(path="README.md")', tool_names) == "sys_os_read"
+    assert _printed_tool_target('sys_os_read path="README.md"', tool_names) == "sys_os_read"
+    assert _printed_tool_target("```skill\ncontribute\n```", tool_names) == "load_skill"
+    assert (
+        _printed_tool_target("```search\nquery=Vaultwarden\n```", tool_names) == "oracle__search"
+    )
+    assert _printed_tool_target("```bash\ngit status\n```", tool_names) is None
+    assert _printed_tool_target("Use sys_os_read when you need the file.", tool_names) is None
+
+
+def test_printed_tool_arguments_lists_properties_and_marks_required() -> None:
+    tools = [
+        {
+            "name": "oracle__fetch",
+            "parameters": {
+                "type": "object",
+                "properties": {"ref": {"type": "string"}, "source": {"type": "string"}},
+                "required": ["ref"],
+            },
+        }
+    ]
+
+    assert _printed_tool_arguments("oracle__fetch", tools) == "ref (required), source"
+    assert _printed_tool_arguments("sys_os_read", tools) == ""
+
+
+def test_printed_tool_recovery_prompt_adds_schema_on_second_attempt() -> None:
+    tools = [
+        {
+            "name": "oracle__fetch",
+            "parameters": {
+                "type": "object",
+                "properties": {"ref": {"type": "string"}},
+                "required": ["ref"],
+            },
+        }
+    ]
+
+    first = _printed_tool_recovery_prompt("oracle__fetch", tools, 1)
+    second = _printed_tool_recovery_prompt("oracle__fetch", tools, 2)
+
+    assert "accepted arguments" not in first
+    assert "ref (required)" in second
+
+    # No schema to quote, so the retry falls back to the plain nudge.
+    assert "accepted arguments" not in _printed_tool_recovery_prompt("missing", tools, 2)
+
+
 class TestRunTurn(unittest.TestCase):
     def _make_executor(self):
         with patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"):
@@ -1942,6 +2178,302 @@ class TestRunTurn(unittest.TestCase):
 
         _run(_test())
 
+    def test_printed_tool_intent_gets_one_protocol_recovery(self):
+        async def _test():
+            executor = self._make_executor()
+            fake_rpc = _PiRpcSession()
+            fake_rpc._line_queue = asyncio.Queue()
+            fake_rpc.process = MagicMock()
+            fake_rpc.process.returncode = None
+            writer = _FakeStreamWriter()
+            fake_rpc.process.stdin = writer
+            fake_rpc._stderr_lines = []
+
+            printed = 'sys_os_read(path="README.md")'
+            assistant_usage = {
+                "input": 100,
+                "output": 20,
+                "cacheRead": 0,
+                "cacheWrite": 0,
+                "totalTokens": 120,
+            }
+            events = [
+                {"type": "response", "success": True},
+                {
+                    "type": "message_start",
+                    "message": {"role": "assistant", "model": "test-model"},
+                },
+                {
+                    "type": "message_update",
+                    "assistantMessageEvent": {
+                        "type": "text_delta",
+                        "delta": "Searching first.",
+                    },
+                },
+                {
+                    "type": "message_end",
+                    "message": {
+                        "role": "assistant",
+                        "model": "test-model",
+                        "stopReason": "toolUse",
+                        "content": [
+                            {
+                                "type": "toolCall",
+                                "id": "call-search",
+                                "name": "oracle__search",
+                                "arguments": {"query": "README"},
+                            }
+                        ],
+                        "usage": assistant_usage,
+                    },
+                },
+                {
+                    "type": "tool_execution_start",
+                    "toolName": "oracle__search",
+                    "args": {"query": "README"},
+                },
+                {
+                    "type": "tool_execution_end",
+                    "toolName": "oracle__search",
+                    "isError": False,
+                    "result": {"content": "search result"},
+                },
+                {
+                    "type": "message_start",
+                    "message": {"role": "assistant", "model": "test-model"},
+                },
+                {
+                    "type": "message_update",
+                    "assistantMessageEvent": {"type": "text_delta", "delta": printed},
+                },
+                {
+                    "type": "message_end",
+                    "message": {
+                        "role": "assistant",
+                        "model": "test-model",
+                        "stopReason": "stop",
+                        "content": [{"type": "text", "text": printed}],
+                        "usage": assistant_usage,
+                    },
+                },
+                {
+                    "type": "agent_end",
+                    "messages": [
+                        {
+                            "role": "assistant",
+                            "content": [{"type": "text", "text": printed}],
+                        }
+                    ],
+                },
+                {"type": "response", "success": True},
+                {
+                    "type": "message_start",
+                    "message": {"role": "assistant", "model": "test-model"},
+                },
+                {
+                    "type": "message_end",
+                    "message": {
+                        "role": "assistant",
+                        "model": "test-model",
+                        "stopReason": "toolUse",
+                        "content": [
+                            {
+                                "type": "toolCall",
+                                "id": "call-read",
+                                "name": "sys_os_read",
+                                "arguments": {"path": "README.md"},
+                            }
+                        ],
+                        "usage": assistant_usage,
+                    },
+                },
+                {
+                    "type": "tool_execution_start",
+                    "toolName": "sys_os_read",
+                    "args": {"path": "README.md"},
+                },
+                {
+                    "type": "tool_execution_end",
+                    "toolName": "sys_os_read",
+                    "isError": False,
+                    "result": {"content": "README"},
+                },
+                {
+                    "type": "message_start",
+                    "message": {"role": "assistant", "model": "test-model"},
+                },
+                {
+                    "type": "message_update",
+                    "assistantMessageEvent": {"type": "text_delta", "delta": "done"},
+                },
+                {
+                    "type": "message_end",
+                    "message": {
+                        "role": "assistant",
+                        "model": "test-model",
+                        "stopReason": "stop",
+                        "content": [{"type": "text", "text": "done"}],
+                        "usage": assistant_usage,
+                    },
+                },
+                {"type": "agent_end", "messages": []},
+            ]
+            for event in events:
+                fake_rpc._line_queue.put_nowait(json.dumps(event))
+
+            async def fake_ensure_rpc(*args, **kwargs):
+                return fake_rpc
+
+            executor._ensure_rpc = fake_ensure_rpc
+            tools = [
+                {
+                    "name": "oracle__search",
+                    "description": "Search evidence.",
+                    "parameters": {"type": "object"},
+                },
+                {
+                    "name": "sys_os_read",
+                    "description": "Read a file.",
+                    "parameters": {"type": "object"},
+                },
+            ]
+
+            emitted = [
+                event
+                async for event in executor.run_turn(
+                    [{"role": "user", "content": "Read README.md"}],
+                    tools,
+                    "system",
+                )
+            ]
+
+            requests = [event for event in emitted if isinstance(event, ToolCallRequest)]
+            completed = [event for event in emitted if isinstance(event, TurnComplete)]
+            self.assertEqual(
+                [event.name for event in requests],
+                ["oracle__search", "sys_os_read"],
+            )
+            self.assertEqual(len(completed), 1)
+            self.assertEqual(completed[0].response, "done")
+
+            commands = [json.loads(frame) for frame in writer.data]
+            recovery = [
+                command
+                for command in commands
+                if command.get("id", "").endswith("_printed_tool_recovery")
+            ]
+            self.assertEqual(len(recovery), 1)
+            self.assertIn("Invoke the registered tool `sys_os_read` now", recovery[0]["message"])
+            self.assertEqual(recovery[0]["streamingBehavior"], "followUp")
+
+        _run(_test())
+
+    def test_printed_tool_intent_retries_then_drops_the_printed_text(self):
+        async def _test():
+            executor = self._make_executor()
+            fake_rpc = _PiRpcSession()
+            fake_rpc._line_queue = asyncio.Queue()
+            fake_rpc.process = MagicMock()
+            fake_rpc.process.returncode = None
+            writer = _FakeStreamWriter()
+            fake_rpc.process.stdin = writer
+            fake_rpc._stderr_lines = []
+
+            printed = 'oracle__fetch(query="repo://HomeLab-Forge/ops/compose.yaml")'
+            assistant_usage = {
+                "input": 100,
+                "output": 20,
+                "cacheRead": 0,
+                "cacheWrite": 0,
+                "totalTokens": 120,
+            }
+
+            def printed_round():
+                return [
+                    {
+                        "type": "message_start",
+                        "message": {"role": "assistant", "model": "test-model"},
+                    },
+                    {
+                        "type": "message_update",
+                        "assistantMessageEvent": {"type": "text_delta", "delta": printed},
+                    },
+                    {
+                        "type": "message_end",
+                        "message": {
+                            "role": "assistant",
+                            "model": "test-model",
+                            "stopReason": "stop",
+                            "content": [{"type": "text", "text": printed}],
+                            "usage": assistant_usage,
+                        },
+                    },
+                    {
+                        "type": "agent_end",
+                        "messages": [
+                            {"role": "assistant", "content": [{"type": "text", "text": printed}]}
+                        ],
+                    },
+                ]
+
+            # Every attempt prints instead of calling: the first turn plus one
+            # response ack per recovery prompt.
+            events = [{"type": "response", "success": True}]
+            events.extend(printed_round())
+            for _ in range(2):
+                events.append({"type": "response", "success": True})
+                events.extend(printed_round())
+            for event in events:
+                fake_rpc._line_queue.put_nowait(json.dumps(event))
+
+            async def fake_ensure_rpc(*args, **kwargs):
+                return fake_rpc
+
+            executor._ensure_rpc = fake_ensure_rpc
+            tools = [
+                {
+                    "name": "oracle__fetch",
+                    "description": "Fetch a ref.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"ref": {"type": "string"}},
+                        "required": ["ref"],
+                    },
+                }
+            ]
+
+            emitted = [
+                event
+                async for event in executor.run_turn(
+                    [{"role": "user", "content": "Fetch the compose file"}],
+                    tools,
+                    "system",
+                )
+            ]
+
+            completed = [event for event in emitted if isinstance(event, TurnComplete)]
+            self.assertEqual(len(completed), 1)
+            # The printed invocation must not survive into the transcript, or the
+            # next turn copies the format instead of calling the tool. The
+            # adapter drops TurnComplete.response for streaming executors, so
+            # the streamed chunks are what actually reaches the session.
+            streamed = "".join(event.text for event in emitted if isinstance(event, TextChunk))
+            self.assertNotIn("oracle__fetch(", streamed)
+            self.assertIn("could not invoke tools", streamed)
+            self.assertNotIn("oracle__fetch(", completed[0].response)
+            self.assertIn("could not invoke tools", completed[0].response)
+
+            commands = [json.loads(frame) for frame in writer.data]
+            recovery = [
+                command
+                for command in commands
+                if command.get("id", "").endswith("_printed_tool_recovery")
+            ]
+            self.assertEqual(len(recovery), 2)
+            self.assertIn("ref (required)", recovery[1]["message"])
+
+        _run(_test())
+
     def test_tool_execution_events(self):
         async def _test():
             executor = self._make_executor()
@@ -2001,6 +2533,182 @@ class TestRunTurn(unittest.TestCase):
             self.assertEqual(len(tool_completes), 1)
             self.assertEqual(tool_completes[0].name, "add")
             self.assertEqual(tool_completes[0].status, ToolCallStatus.SUCCESS)
+
+        _run(_test())
+
+    def test_smart_compaction_uses_completed_tool_batch_when_message_omits_call(self):
+        async def _test():
+            with patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"):
+                executor = PiExecutor(
+                    smart_compaction=SmartCompactionConfig(
+                        enabled=True,
+                        trigger_tokens=50,
+                        instructions="Preserve semantic progress.",
+                    )
+                )
+
+            first_rpc = _PiRpcSession()
+            first_rpc._line_queue = asyncio.Queue()
+            first_rpc.process = MagicMock()
+            first_rpc.process.returncode = None
+            first_writer = _FakeStreamWriter()
+            first_rpc.process.stdin = first_writer
+            first_rpc._stderr_lines = []
+
+            draft = {
+                "original_directive": "model copy",
+                "objective": "Finish the task.",
+                "phase": "validate",
+                "completed_outcomes": ["Read the target file."],
+                "verified_facts": ["The file exists."],
+                "validations": [],
+                "failed_approaches": [],
+                "decisions": [],
+                "remaining_work": ["Return the final result."],
+                "next_action": "Return the final result.",
+                "theories": [],
+                "do_not_repeat": ["Do not read the file again."],
+                "blockers": [],
+                "user_questions": [],
+                "active_waits": [],
+                "evidence_refs": ["README.md"],
+                "loaded_skills": [],
+            }
+            first_lines = [
+                {"type": "response", "success": True},
+                {
+                    "type": "message_end",
+                    "message": {
+                        "role": "assistant",
+                        "model": "test-model",
+                        "stopReason": "toolUse",
+                        "content": [{"type": "text", "text": "I will read the file."}],
+                        "usage": {
+                            "input": 50,
+                            "output": 10,
+                            "cacheRead": 0,
+                            "cacheWrite": 0,
+                            "totalTokens": 60,
+                        },
+                    },
+                },
+                {
+                    "type": "tool_execution_start",
+                    "toolName": "sys_os_read",
+                    "args": {"path": "README.md"},
+                },
+                {
+                    "type": "tool_execution_end",
+                    "toolName": "sys_os_read",
+                    "isError": False,
+                    "result": {"content": "read"},
+                },
+                {
+                    "type": "turn_end",
+                    "toolResults": [
+                        {
+                            "role": "toolResult",
+                            "toolCallId": "call-read",
+                            "toolName": "sys_os_read",
+                            "content": [{"type": "text", "text": "read"}],
+                            "isError": False,
+                        }
+                    ],
+                },
+                {"type": "agent_end", "messages": []},
+                {"type": "compaction_start", "reason": "manual"},
+                {
+                    "type": "compaction_end",
+                    "reason": "manual",
+                    "aborted": False,
+                    "result": {
+                        "summary": "structured handover",
+                        "estimatedTokensAfter": 800,
+                        "details": {
+                            "type": "omnigent_session_handover",
+                            "version": 1,
+                            "draft": draft,
+                        },
+                    },
+                },
+            ]
+            for event in first_lines:
+                first_rpc._line_queue.put_nowait(json.dumps(event))
+
+            second_rpc = _PiRpcSession()
+            second_rpc._line_queue = asyncio.Queue()
+            second_rpc.process = MagicMock()
+            second_rpc.process.returncode = None
+            second_rpc.process.stdin = _FakeStreamWriter()
+            second_rpc._stderr_lines = []
+            second_lines = [
+                {"type": "response", "success": True},
+                {
+                    "type": "message_update",
+                    "assistantMessageEvent": {"type": "text_delta", "delta": "done"},
+                },
+                {
+                    "type": "message_end",
+                    "message": {
+                        "role": "assistant",
+                        "model": "test-model",
+                        "stopReason": "stop",
+                        "content": [{"type": "text", "text": "done"}],
+                        "usage": {
+                            "input": 20,
+                            "output": 4,
+                            "cacheRead": 0,
+                            "cacheWrite": 0,
+                            "totalTokens": 24,
+                        },
+                    },
+                },
+                {"type": "agent_end", "messages": []},
+            ]
+            for event in second_lines:
+                second_rpc._line_queue.put_nowait(json.dumps(event))
+
+            async def fake_ensure_rpc(*args, **kwargs):
+                return first_rpc
+
+            continuation: dict[str, str] = {}
+
+            async def fake_restart(**kwargs):
+                continuation["text"] = kwargs["continuation"]
+                return second_rpc
+
+            executor._ensure_rpc = fake_ensure_rpc
+            executor._restart_rpc_for_handover = fake_restart
+
+            events = [
+                event
+                async for event in executor.run_turn(
+                    [{"role": "user", "content": "Exact directive."}],
+                    [],
+                    "system",
+                )
+            ]
+
+            compacted = [event for event in events if isinstance(event, CompactionComplete)]
+            completed = [event for event in events if isinstance(event, TurnComplete)]
+            self.assertEqual(len(compacted), 1)
+            self.assertTrue(compacted[0].handover_loaded)
+            self.assertEqual(compacted[0].handover["mode"], "structured")
+            self.assertEqual(
+                compacted[0].handover["original_directive"],
+                "Exact directive.",
+            )
+            self.assertIn("<session_handover>", continuation["text"])
+            self.assertEqual(len(completed), 1)
+            self.assertEqual(completed[0].response, "done")
+
+            sent = [json.loads(frame) for frame in first_writer.data]
+            compact_commands = [frame for frame in sent if frame.get("type") == "compact"]
+            self.assertEqual(len(compact_commands), 1)
+            self.assertIn(
+                "OMNIGENT_STRUCTURED_HANDOVER_V1",
+                compact_commands[0]["customInstructions"],
+            )
 
         _run(_test())
 
@@ -2145,6 +2853,17 @@ class TestRunTurn(unittest.TestCase):
                     }
                 ),
                 json.dumps({"type": "agent_end", "messages": []}),
+                json.dumps({"type": "response", "success": True}),
+                json.dumps(
+                    {
+                        "type": "message_update",
+                        "assistantMessageEvent": {
+                            "type": "text_delta",
+                            "delta": "The tool failed after the attempted recovery.",
+                        },
+                    }
+                ),
+                json.dumps({"type": "agent_end", "messages": []}),
             ]
             for line in lines:
                 fake_rpc._line_queue.put_nowait(line)
@@ -2210,9 +2929,11 @@ class TestRunTurn(unittest.TestCase):
                 )
             ]
 
-            self.assertEqual(len(events), 1)
-            self.assertIsInstance(events[0], ExecutorError)
-            self.assertIn("Rate limited", events[0].message)
+            self.assertEqual(len(events), 2)
+            self.assertIsInstance(events[0], LLMCallComplete)
+            self.assertEqual(events[0].error, "Rate limited")
+            self.assertIsInstance(events[1], ExecutorError)
+            self.assertIn("Rate limited", events[1].message)
 
         _run(_test())
 
@@ -2264,9 +2985,11 @@ class TestRunTurn(unittest.TestCase):
                 )
             ]
 
-            self.assertEqual(len(events), 1)
-            self.assertIsInstance(events[0], ExecutorError)
-            self.assertEqual(events[0].message, "boom")
+            self.assertEqual(len(events), 2)
+            self.assertIsInstance(events[0], LLMCallComplete)
+            self.assertEqual(events[0].error, "boom")
+            self.assertIsInstance(events[1], ExecutorError)
+            self.assertEqual(events[1].message, "boom")
 
         _run(_test())
 
@@ -2357,18 +3080,10 @@ class TestRunTurn(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 
-def _executor_with_scripted_rpc(lines: list[str], model: str | None = None) -> PiExecutor:
-    """
-    Build a :class:`PiExecutor` whose RPC session replays scripted JSONL.
-
-    :param lines: JSONL event lines the fake Pi process emits, in order,
-        e.g. ``[json.dumps({"type": "response", "success": True})]``.
-    :param model: Optional model override (``self._model_override``),
-        used to exercise the usage ``model`` fallback when the assistant
-        message omits its own ``model`` field.
-    :returns: Executor with ``_ensure_rpc`` patched to a fake session
-        pre-loaded with ``lines``.
-    """
+def _executor_and_scripted_rpc(
+    lines: list[str], model: str | None = None
+) -> tuple[PiExecutor, _PiRpcSession]:
+    """Build a Pi executor and expose its scripted RPC session."""
     with patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"):
         executor = PiExecutor(model=model)
     fake_rpc = _PiRpcSession()
@@ -2382,6 +3097,22 @@ def _executor_with_scripted_rpc(lines: list[str], model: str | None = None) -> P
         return fake_rpc
 
     executor._ensure_rpc = fake_ensure_rpc
+    return executor, fake_rpc
+
+
+def _executor_with_scripted_rpc(lines: list[str], model: str | None = None) -> PiExecutor:
+    """
+    Build a :class:`PiExecutor` whose RPC session replays scripted JSONL.
+
+    :param lines: JSONL event lines the fake Pi process emits, in order,
+        e.g. ``[json.dumps({"type": "response", "success": True})]``.
+    :param model: Optional model override (``self._model_override``),
+        used to exercise the usage ``model`` fallback when the assistant
+        message omits its own ``model`` field.
+    :returns: Executor with ``_ensure_rpc`` patched to a fake session
+        pre-loaded with ``lines``.
+    """
+    executor, _ = _executor_and_scripted_rpc(lines, model)
     return executor
 
 
@@ -2722,6 +3453,20 @@ class TestBlockedToolDetection(unittest.TestCase):
             fake_rpc._stderr_lines = []
 
             for line in event_lines:
+                fake_rpc._line_queue.put_nowait(line)
+            for line in (
+                json.dumps({"type": "response", "success": True}),
+                json.dumps(
+                    {
+                        "type": "message_update",
+                        "assistantMessageEvent": {
+                            "type": "text_delta",
+                            "delta": "No permitted alternative is available.",
+                        },
+                    }
+                ),
+                json.dumps({"type": "agent_end", "messages": []}),
+            ):
                 fake_rpc._line_queue.put_nowait(line)
 
             async def fake_ensure_rpc(*args, **kwargs):
@@ -4115,6 +4860,201 @@ def test_pi_usage_captured_from_message_end() -> None:
     _run(_test())
 
 
+def test_pi_emits_model_call_boundaries_with_per_call_usage() -> None:
+    """Each Pi assistant message becomes one traced model call."""
+
+    async def _test() -> None:
+        first = _pi_assistant_message_with_usage(
+            text="",
+            input_tokens=100,
+            output_tokens=20,
+            cache_read=10,
+            cache_write=2,
+            total_tokens=132,
+        )
+        first["content"] = [{"type": "thinking", "thinking": "Use the tool."}]
+        second = _pi_assistant_message_with_usage(
+            text="Done.",
+            input_tokens=140,
+            output_tokens=25,
+            cache_read=12,
+            cache_write=3,
+            total_tokens=180,
+        )
+        executor = _executor_with_scripted_rpc(
+            [
+                json.dumps({"type": "response", "success": True}),
+                json.dumps({"type": "message_start", "message": first}),
+                json.dumps({"type": "message_end", "message": first}),
+                json.dumps(
+                    {
+                        "type": "tool_execution_start",
+                        "toolName": "sys_os_read",
+                        "args": {"path": "README.md"},
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "tool_execution_end",
+                        "toolName": "sys_os_read",
+                        "isError": False,
+                        "result": "contents",
+                    }
+                ),
+                json.dumps({"type": "message_start", "message": second}),
+                json.dumps({"type": "message_end", "message": second}),
+                json.dumps({"type": "agent_end", "messages": [first, second]}),
+            ]
+        )
+
+        events = [
+            event
+            async for event in executor.run_turn(
+                [{"role": "user", "content": "inspect"}],
+                [],
+                "system",
+            )
+        ]
+
+        boundaries = [
+            event
+            for event in events
+            if isinstance(
+                event,
+                (LLMCallStarted, LLMCallComplete, ToolCallRequest, ToolCallComplete),
+            )
+        ]
+        assert [type(event) for event in boundaries] == [
+            LLMCallStarted,
+            LLMCallComplete,
+            ToolCallRequest,
+            ToolCallComplete,
+            LLMCallStarted,
+            LLMCallComplete,
+        ]
+        completions = [event for event in boundaries if isinstance(event, LLMCallComplete)]
+        assert completions[0].reasoning == "Use the tool."
+        assert completions[0].usage is not None
+        assert completions[0].usage["input_tokens"] == 100
+        assert completions[1].response == "Done."
+        assert completions[1].usage is not None
+        assert completions[1].usage["input_tokens"] == 140
+
+    _run(_test())
+
+
+def test_pi_ignores_non_assistant_message_boundaries() -> None:
+    """User and tool-result messages do not create empty model-call spans."""
+
+    async def _test() -> None:
+        assistant = _pi_assistant_message_with_usage(text="Done.")
+        user = {"role": "user", "content": "inspect"}
+        tool_result = {
+            "role": "toolResult",
+            "toolCallId": "call-1",
+            "toolName": "read",
+            "content": [{"type": "text", "text": "contents"}],
+            "isError": False,
+        }
+        executor = _executor_with_scripted_rpc(
+            [
+                json.dumps({"type": "response", "success": True}),
+                json.dumps({"type": "message_start", "message": user}),
+                json.dumps({"type": "message_end", "message": user}),
+                json.dumps({"type": "message_start", "message": tool_result}),
+                json.dumps({"type": "message_end", "message": tool_result}),
+                json.dumps({"type": "message_start", "message": assistant}),
+                json.dumps({"type": "message_end", "message": assistant}),
+                json.dumps({"type": "agent_end", "messages": [assistant]}),
+            ]
+        )
+
+        events = [
+            event
+            async for event in executor.run_turn(
+                [{"role": "user", "content": "inspect"}],
+                [],
+                "system",
+            )
+        ]
+
+        starts = [event for event in events if isinstance(event, LLMCallStarted)]
+        completions = [event for event in events if isinstance(event, LLMCallComplete)]
+        assert len(starts) == 1
+        assert len(completions) == 1
+        assert starts[0].model == "claude-sonnet-4-6"
+
+    _run(_test())
+
+
+def test_pi_model_calls_include_new_user_and_tool_result_inputs() -> None:
+    """Each Pi model boundary carries the new messages that triggered it."""
+
+    async def _test() -> None:
+        user = {"role": "user", "content": "inspect"}
+        first = _pi_assistant_message_with_usage(text="")
+        first["content"] = [{"type": "thinking", "thinking": "Use the tool."}]
+        tool_result = {
+            "role": "toolResult",
+            "toolCallId": "call-1",
+            "toolName": "read",
+            "content": [{"type": "text", "text": "contents"}],
+            "isError": False,
+        }
+        second = _pi_assistant_message_with_usage(text="Done.")
+        executor = _executor_with_scripted_rpc(
+            [
+                json.dumps({"type": "response", "success": True}),
+                json.dumps({"type": "message_start", "message": user}),
+                json.dumps({"type": "message_end", "message": user}),
+                json.dumps({"type": "message_start", "message": first}),
+                json.dumps({"type": "message_end", "message": first}),
+                json.dumps(
+                    {
+                        "type": "tool_execution_start",
+                        "toolName": "read",
+                        "args": {"path": "README.md"},
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "tool_execution_end",
+                        "toolName": "read",
+                        "isError": False,
+                        "result": "contents",
+                    }
+                ),
+                json.dumps({"type": "message_start", "message": tool_result}),
+                json.dumps({"type": "message_end", "message": tool_result}),
+                json.dumps({"type": "message_start", "message": second}),
+                json.dumps({"type": "message_end", "message": second}),
+                json.dumps(
+                    {
+                        "type": "agent_end",
+                        "messages": [first, tool_result, second],
+                    }
+                ),
+            ]
+        )
+
+        events = [
+            event
+            async for event in executor.run_turn(
+                [{"role": "user", "content": "inspect"}],
+                [],
+                "system",
+            )
+        ]
+
+        starts = [event for event in events if isinstance(event, LLMCallStarted)]
+        assert [event.input for event in starts] == [
+            [{"role": "user", "content": "inspect"}],
+            [tool_result],
+        ]
+
+    _run(_test())
+
+
 def test_pi_usage_fallback_from_agent_end() -> None:
     """
     When no ``message_end`` carried usage, the ``agent_end`` handler falls
@@ -4292,6 +5232,654 @@ def test_pi_usage_sums_across_multiple_message_end() -> None:
     _run(_test())
 
 
+def test_pi_retries_empty_completion_after_tool_activity() -> None:
+    """An empty post-tool completion gets a framework continuation."""
+
+    async def _test() -> None:
+        executor, rpc = _executor_and_scripted_rpc(
+            [
+                json.dumps({"type": "response", "success": True}),
+                json.dumps(
+                    {
+                        "type": "tool_execution_start",
+                        "toolName": "oracle__fetch",
+                        "args": {"ref": "oracle://trace/h1"},
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "tool_execution_end",
+                        "toolName": "oracle__fetch",
+                        "isError": False,
+                        "result": {"content": "evidence"},
+                    }
+                ),
+                json.dumps({"type": "agent_end", "messages": []}),
+                json.dumps({"type": "response", "success": True}),
+                json.dumps(
+                    {
+                        "type": "message_update",
+                        "assistantMessageEvent": {
+                            "type": "text_delta",
+                            "delta": "The evidence identifies the failure.",
+                        },
+                    }
+                ),
+                json.dumps({"type": "agent_end", "messages": []}),
+            ]
+        )
+
+        events = [
+            event
+            async for event in executor.run_turn(
+                [{"role": "user", "content": "investigate"}],
+                [],
+                "system",
+            )
+        ]
+
+        completed = [event for event in events if isinstance(event, TurnComplete)]
+        assert len(completed) == 1
+        assert completed[0].response == "The evidence identifies the failure."
+        assert len([event for event in events if isinstance(event, ToolCallComplete)]) == 1
+        written = b"".join(rpc.process.stdin.data).decode()
+        commands = [json.loads(line) for line in written.splitlines()]
+        assert len([item for item in commands if item.get("type") == "prompt"]) == 2
+        assert "try a different permitted tool" in written
+
+    _run(_test())
+
+
+def test_pi_retries_idle_timeout_after_tool_activity() -> None:
+    """A silent post-tool Pi loop gets the same bounded continuation."""
+
+    async def _test() -> None:
+        executor, rpc = _executor_and_scripted_rpc([])
+        lines: list[str | None] = [
+            json.dumps({"type": "response", "success": True}),
+            json.dumps(
+                {
+                    "type": "tool_execution_start",
+                    "toolName": "oracle__fetch",
+                    "args": {"ref": "oracle://trace/h1"},
+                }
+            ),
+            json.dumps(
+                {
+                    "type": "tool_execution_end",
+                    "toolName": "oracle__fetch",
+                    "isError": False,
+                    "result": {"content": "evidence"},
+                }
+            ),
+            None,
+            json.dumps({"type": "response", "success": True}),
+            json.dumps(
+                {
+                    "type": "message_update",
+                    "assistantMessageEvent": {
+                        "type": "text_delta",
+                        "delta": "The PR is repaired.",
+                    },
+                }
+            ),
+            json.dumps({"type": "agent_end", "messages": []}),
+        ]
+
+        idle_timeouts: list[float] = []
+
+        async def read_line(timeout=120.0):
+            line = lines.pop(0) if lines else None
+            rpc._last_read_timed_out = line is None
+            if line is None:
+                idle_timeouts.append(timeout)
+            return line
+
+        rpc.read_line = read_line
+        events = [
+            event
+            async for event in executor.run_turn(
+                [{"role": "user", "content": "repair the PR"}],
+                [],
+                "system",
+            )
+        ]
+
+        assert not any(isinstance(event, ExecutorError) for event in events)
+        completed = [event for event in events if isinstance(event, TurnComplete)]
+        assert len(completed) == 1
+        assert completed[0].response == "The PR is repaired."
+        commands = [
+            json.loads(line) for line in b"".join(rpc.process.stdin.data).decode().splitlines()
+        ]
+        prompts = [item for item in commands if item.get("type") == "prompt"]
+        assert len(prompts) == 2
+        assert prompts[1]["streamingBehavior"] == "followUp"
+        assert idle_timeouts == [70.0]
+
+    _run(_test())
+
+
+def test_pi_waits_when_tool_execution_exceeds_idle_timeout() -> None:
+    """A quiet in-flight tool is not mistaken for an incomplete turn."""
+
+    async def _test() -> None:
+        executor, rpc = _executor_and_scripted_rpc([])
+        lines: list[str | None] = [
+            json.dumps({"type": "response", "success": True}),
+            json.dumps(
+                {
+                    "type": "tool_execution_start",
+                    "toolName": "oracle__search",
+                    "args": {"query": "review the PR"},
+                }
+            ),
+            None,
+            json.dumps(
+                {
+                    "type": "tool_execution_end",
+                    "toolName": "oracle__search",
+                    "isError": False,
+                    "result": {"summary": "evidence collected"},
+                }
+            ),
+            json.dumps(
+                {
+                    "type": "message_update",
+                    "assistantMessageEvent": {
+                        "type": "text_delta",
+                        "delta": "The PR needs changes.",
+                    },
+                }
+            ),
+            json.dumps({"type": "agent_end", "messages": []}),
+        ]
+
+        async def read_line(timeout=120.0):
+            del timeout
+            line = lines.pop(0) if lines else None
+            rpc._last_read_timed_out = line is None
+            return line
+
+        rpc.read_line = read_line
+        events = [
+            event
+            async for event in executor.run_turn(
+                [{"role": "user", "content": "review the PR"}],
+                [],
+                "system",
+            )
+        ]
+
+        assert not any(isinstance(event, ExecutorError) for event in events)
+        assert len([event for event in events if isinstance(event, ExecutorProgress)]) == 1
+        completed = [event for event in events if isinstance(event, TurnComplete)]
+        assert len(completed) == 1
+        assert completed[0].response == "The PR needs changes."
+        commands = [
+            json.loads(line) for line in b"".join(rpc.process.stdin.data).decode().splitlines()
+        ]
+        assert len([item for item in commands if item.get("type") == "prompt"]) == 1
+
+    _run(_test())
+
+
+def test_pi_appends_the_agent_completion_contract() -> None:
+    """Pi receives the framework-owned completion contract."""
+
+    async def _test() -> None:
+        executor, rpc = _executor_and_scripted_rpc(
+            [
+                json.dumps({"type": "response", "success": True}),
+                json.dumps(
+                    {
+                        "type": "message_update",
+                        "assistantMessageEvent": {
+                            "type": "text_delta",
+                            "delta": "Resolved.",
+                        },
+                    }
+                ),
+                json.dumps({"type": "agent_end", "messages": []}),
+            ]
+        )
+        captured: dict[str, str] = {}
+
+        async def fake_ensure_rpc(session_key, system_prompt, model, tools):
+            captured["system_prompt"] = system_prompt
+            return rpc
+
+        executor._ensure_rpc = fake_ensure_rpc
+        events = [
+            event
+            async for event in executor.run_turn(
+                [{"role": "user", "content": "investigate"}],
+                [],
+                "base instructions",
+            )
+        ]
+
+        assert any(isinstance(event, TurnComplete) for event in events)
+        assert captured["system_prompt"].startswith("base instructions")
+        assert "try a different permitted approach" in captured["system_prompt"]
+
+    _run(_test())
+
+
+def test_pi_continues_when_progress_text_precedes_the_last_tool() -> None:
+    """Progress text before a tool does not satisfy task closure."""
+
+    async def _test() -> None:
+        executor, rpc = _executor_and_scripted_rpc(
+            [
+                json.dumps({"type": "response", "success": True}),
+                json.dumps(
+                    {
+                        "type": "message_update",
+                        "assistantMessageEvent": {
+                            "type": "text_delta",
+                            "delta": "I will inspect the evidence. ",
+                        },
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "tool_execution_end",
+                        "toolName": "oracle__fetch",
+                        "isError": False,
+                        "result": {"content": "evidence"},
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "agent_end",
+                        "messages": [
+                            {
+                                "role": "assistant",
+                                "content": [
+                                    {
+                                        "type": "text",
+                                        "text": "I will inspect the evidence. ",
+                                    },
+                                    {
+                                        "type": "toolCall",
+                                        "id": "call-1",
+                                        "name": "oracle__fetch",
+                                        "arguments": {},
+                                    },
+                                ],
+                            }
+                        ],
+                    }
+                ),
+                json.dumps({"type": "response", "success": True}),
+                json.dumps(
+                    {
+                        "type": "message_update",
+                        "assistantMessageEvent": {
+                            "type": "text_delta",
+                            "delta": "The evidence identifies the failure.",
+                        },
+                    }
+                ),
+                json.dumps({"type": "agent_end", "messages": []}),
+            ]
+        )
+
+        events = [
+            event
+            async for event in executor.run_turn(
+                [{"role": "user", "content": "investigate"}],
+                [],
+                "system",
+            )
+        ]
+
+        completed = [event for event in events if isinstance(event, TurnComplete)]
+        assert len(completed) == 1
+        assert completed[0].response.endswith("The evidence identifies the failure.")
+        written = b"".join(rpc.process.stdin.data).decode()
+        assert written.count('"type": "prompt"') == 2
+
+    _run(_test())
+
+
+def test_pi_requests_recovery_after_a_failed_tool() -> None:
+    """Pi gets another turn when it gives up after the first failed tool."""
+
+    async def _test() -> None:
+        executor, rpc = _executor_and_scripted_rpc(
+            [
+                json.dumps({"type": "response", "success": True}),
+                json.dumps(
+                    {
+                        "type": "tool_execution_end",
+                        "toolName": "oracle__fetch",
+                        "isError": True,
+                        "result": {"error": "reference expired"},
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "message_update",
+                        "assistantMessageEvent": {
+                            "type": "text_delta",
+                            "delta": "I cannot determine the answer.",
+                        },
+                    }
+                ),
+                json.dumps({"type": "agent_end", "messages": []}),
+                json.dumps({"type": "response", "success": True}),
+                json.dumps(
+                    {
+                        "type": "tool_execution_start",
+                        "toolName": "oracle__search",
+                        "args": {"query": "same evidence by subject"},
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "tool_execution_end",
+                        "toolName": "oracle__search",
+                        "isError": False,
+                        "result": {"hits": [{"ref": "oracle://trace/h2"}]},
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "message_update",
+                        "assistantMessageEvent": {
+                            "type": "text_delta",
+                            "delta": " The alternate search found the answer.",
+                        },
+                    }
+                ),
+                json.dumps({"type": "agent_end", "messages": []}),
+            ]
+        )
+
+        events = [
+            event
+            async for event in executor.run_turn(
+                [{"role": "user", "content": "investigate"}],
+                [],
+                "system",
+            )
+        ]
+
+        tool_events = [event for event in events if isinstance(event, ToolCallComplete)]
+        assert [event.status for event in tool_events] == [
+            ToolCallStatus.ERROR,
+            ToolCallStatus.SUCCESS,
+        ]
+        assert any(isinstance(event, TurnComplete) for event in events)
+        written = b"".join(rpc.process.stdin.data).decode()
+        assert written.count('"type": "prompt"') == 2
+        assert "try a different permitted tool" in written
+
+    _run(_test())
+
+
+def _init_repo(root: Path, tracked: str = "file.txt") -> None:
+    """Create a committed git repository at *root*."""
+    root.mkdir(parents=True, exist_ok=True)
+    run = lambda *args: subprocess.run(  # noqa: E731
+        ["git", *args], cwd=root, check=True, capture_output=True
+    )
+    run("init", "-q")
+    run("config", "user.email", "t@example.com")
+    run("config", "user.name", "t")
+    run("config", "commit.gpgsign", "false")
+    (root / tracked).write_text("one\n", encoding="utf-8")
+    run("add", tracked)
+    run("commit", "-qm", "init")
+
+
+def test_repository_state_finds_the_checkout_below_a_workspace() -> None:
+    """A workspace of checkouts reports the one holding uncommitted work."""
+    with tempfile.TemporaryDirectory() as tmp:
+        workspace = Path(tmp)
+        _init_repo(workspace / "Org" / "clean")
+        _init_repo(workspace / "Org" / "dirty")
+        (workspace / "Org" / "dirty" / "file.txt").write_text("two\n", encoding="utf-8")
+
+        state = pi_executor._capture_repository_state(str(workspace))
+
+        assert state is not None
+        assert state.modified_paths == ["file.txt"]
+        assert state.workspace is not None
+        assert state.workspace.replace("\\", "/").endswith("Org/dirty")
+
+
+def test_repository_state_keeps_the_workspace_when_nothing_is_dirty() -> None:
+    """A workspace whose checkouts are all clean still reports the workspace."""
+    with tempfile.TemporaryDirectory() as tmp:
+        workspace = Path(tmp)
+        _init_repo(workspace / "Org" / "clean")
+
+        state = pi_executor._capture_repository_state(str(workspace))
+
+        assert state is not None
+        assert state.modified_paths == []
+        assert state.untracked_paths == []
+
+
+def test_repository_state_prefers_the_checkout_the_cwd_is_inside() -> None:
+    """A cwd that is itself a repository is used directly, not scanned for."""
+    with tempfile.TemporaryDirectory() as tmp:
+        repo = Path(tmp) / "repo"
+        _init_repo(repo)
+        (repo / "file.txt").write_text("changed\n", encoding="utf-8")
+
+        state = pi_executor._capture_repository_state(str(repo))
+
+        assert state is not None
+        assert state.modified_paths == ["file.txt"]
+
+
+def _silent_post_tool_rpc_lines() -> list[str]:
+    """Pi acknowledging each continuation and ending the turn with no text."""
+    return [
+        json.dumps({"type": "response", "success": True}),
+        json.dumps({"type": "agent_end", "messages": []}),
+        json.dumps({"type": "response", "success": True}),
+        json.dumps({"type": "agent_end", "messages": []}),
+        json.dumps({"type": "response", "success": True}),
+        json.dumps({"type": "agent_end", "messages": []}),
+    ]
+
+
+def _scripted_rpc(lines: list[str]) -> _PiRpcSession:
+    """A fake RPC session pre-loaded with ``lines``."""
+    rpc = _PiRpcSession()
+    rpc._line_queue = asyncio.Queue()
+    rpc.process = _FakeProcess()
+    rpc._stderr_lines = []
+    for line in lines:
+        rpc._line_queue.put_nowait(line)
+    return rpc
+
+
+def test_pi_restarts_behind_a_handover_after_bounded_empty_continuations() -> None:
+    """A spent continuation budget restarts Pi instead of failing the turn."""
+
+    async def _test() -> None:
+        executor = _executor_with_scripted_rpc(
+            [
+                json.dumps({"type": "response", "success": True}),
+                json.dumps(
+                    {
+                        "type": "tool_execution_end",
+                        "toolName": "oracle__fetch",
+                        "isError": False,
+                        "result": {"content": "evidence"},
+                    }
+                ),
+                *_silent_post_tool_rpc_lines(),
+            ]
+        )
+        restarted = _scripted_rpc(
+            [
+                json.dumps({"type": "response", "success": True}),
+                json.dumps(
+                    {
+                        "type": "message_update",
+                        "assistantMessageEvent": {
+                            "type": "text_delta",
+                            "delta": "Resumed from the handover.",
+                        },
+                    }
+                ),
+                json.dumps({"type": "agent_end", "messages": []}),
+            ]
+        )
+        continuation: dict[str, str] = {}
+
+        async def fake_restart(**kwargs):
+            continuation["text"] = kwargs["continuation"]
+            return restarted
+
+        executor._restart_rpc_for_handover = fake_restart
+
+        events = [
+            event
+            async for event in executor.run_turn(
+                [{"role": "user", "content": "investigate"}],
+                [],
+                "system",
+            )
+        ]
+
+        assert not any(isinstance(event, ExecutorError) for event in events)
+        compacted = [event for event in events if isinstance(event, CompactionComplete)]
+        assert len(compacted) == 1
+        assert compacted[0].handover_loaded is True
+        assert compacted[0].handover["original_directive"] == "investigate"
+        assert "<session_handover>" in continuation["text"]
+        completed = [event for event in events if isinstance(event, TurnComplete)]
+        assert len(completed) == 1
+        assert completed[0].response == "Resumed from the handover."
+
+    _run(_test())
+
+
+def test_pi_hands_off_when_the_restarted_turn_stays_silent() -> None:
+    """A second silence ends the turn with a handoff, not a failed session."""
+
+    async def _test() -> None:
+        executor = _executor_with_scripted_rpc(
+            [
+                json.dumps({"type": "response", "success": True}),
+                json.dumps(
+                    {
+                        "type": "tool_execution_end",
+                        "toolName": "oracle__fetch",
+                        "isError": False,
+                        "result": {"content": "evidence"},
+                    }
+                ),
+                *_silent_post_tool_rpc_lines(),
+            ]
+        )
+        restarts = 0
+
+        async def fake_restart(**kwargs):
+            nonlocal restarts
+            restarts += 1
+            return _scripted_rpc(_silent_post_tool_rpc_lines())
+
+        executor._restart_rpc_for_handover = fake_restart
+
+        events = [
+            event
+            async for event in executor.run_turn(
+                [{"role": "user", "content": "investigate"}],
+                [],
+                "system",
+            )
+        ]
+
+        assert restarts == 1
+        assert not any(isinstance(event, ExecutorError) for event in events)
+        completed = [event for event in events if isinstance(event, TurnComplete)]
+        assert len(completed) == 1
+        assert completed[0].response == PI_TOOL_TURN_WEDGED_RESPONSE
+        chunks = [event for event in events if isinstance(event, TextChunk)]
+        assert chunks[-1].text == PI_TOOL_TURN_WEDGED_RESPONSE
+
+    _run(_test())
+
+
+def test_pi_resets_empty_completion_budget_after_tool_progress() -> None:
+    """A completed tool call resets the consecutive continuation limit."""
+
+    async def _test() -> None:
+        executor, rpc = _executor_and_scripted_rpc(
+            [
+                json.dumps({"type": "response", "success": True}),
+                json.dumps(
+                    {
+                        "type": "tool_execution_end",
+                        "toolName": "oracle__fetch",
+                        "isError": False,
+                        "result": {"content": "initial evidence"},
+                    }
+                ),
+                json.dumps({"type": "agent_end", "messages": []}),
+                json.dumps({"type": "response", "success": True}),
+                json.dumps({"type": "agent_end", "messages": []}),
+                json.dumps({"type": "response", "success": True}),
+                json.dumps(
+                    {
+                        "type": "tool_execution_start",
+                        "toolName": "read",
+                        "args": {"path": "README.md"},
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "tool_execution_end",
+                        "toolName": "read",
+                        "isError": False,
+                        "result": {"content": "more evidence"},
+                    }
+                ),
+                json.dumps({"type": "agent_end", "messages": []}),
+                json.dumps({"type": "response", "success": True}),
+                json.dumps(
+                    {
+                        "type": "message_update",
+                        "assistantMessageEvent": {
+                            "type": "text_delta",
+                            "delta": "Resolved.",
+                        },
+                    }
+                ),
+                json.dumps({"type": "agent_end", "messages": []}),
+            ]
+        )
+
+        events = [
+            event
+            async for event in executor.run_turn(
+                [{"role": "user", "content": "investigate"}],
+                [],
+                "system",
+            )
+        ]
+
+        assert not any(isinstance(event, ExecutorError) for event in events)
+        completed = [event for event in events if isinstance(event, TurnComplete)]
+        assert len(completed) == 1
+        assert completed[0].response == "Resolved."
+        written = b"".join(rpc.process.stdin.data).decode().splitlines()
+        commands = [json.loads(line) for line in written]
+        prompts = [command for command in commands if command.get("type") == "prompt"]
+        assert len(prompts) == 4
+
+    _run(_test())
+
+
 def test_pi_turn_without_usage_leaves_usage_none() -> None:
     """
     A turn whose pi events never carry a ``usage`` object completes with
@@ -4333,3 +5921,293 @@ def test_pi_turn_without_usage_leaves_usage_none() -> None:
         assert turn_complete[0].response == "Hi there"
 
     _run(_test())
+
+
+# ---------------------------------------------------------------------------
+# Cancellation and handover liveness
+# ---------------------------------------------------------------------------
+
+
+def _handover_lines() -> list[str]:
+    """Events that drive a turn into an in-progress structured handover."""
+    return [
+        json.dumps({"type": "response", "success": True}),
+        json.dumps(
+            {
+                "type": "message_end",
+                "message": {
+                    "role": "assistant",
+                    "usage": {"totalTokens": 60_000},
+                    "stopReason": "end_turn",
+                },
+            }
+        ),
+        json.dumps({"type": "turn_end", "toolResults": [{"name": "sys_os_read"}]}),
+    ]
+
+
+def test_waiting_for_a_handover_reports_progress() -> None:
+    """A handover that outlives the poll interval says so, once per poll.
+
+    The scaffold fails a turn that goes quiet for 240 seconds. A handover is
+    one uninterrupted model call with a 300-second budget of its own, so
+    without a progress event on every poll the outer watchdog always wins and
+    the larger budget never applies.
+    """
+
+    async def _test() -> None:
+        executor, rpc = _executor_and_scripted_rpc(_handover_lines())
+        executor._smart_compaction = SmartCompactionConfig(
+            enabled=True,
+            trigger_tokens=1_000,
+            timeout_seconds=0.3,
+            poll_interval_seconds=0.05,
+        )
+        scripted = list(rpc._line_queue._queue)
+        rpc._line_queue = asyncio.Queue()
+
+        async def read_line(timeout=120.0):
+            if scripted:
+                rpc._last_read_timed_out = False
+                return scripted.pop(0)
+            # Every later read is the handover poll timing out. Capped so a
+            # regression that never starts the handover fails fast instead of
+            # sitting on the 120-second default.
+            await asyncio.sleep(min(timeout, 0.05))
+            rpc._last_read_timed_out = True
+            return None
+
+        rpc.read_line = read_line
+
+        events = [
+            event
+            async for event in executor.run_turn(
+                [{"role": "user", "content": "keep going"}], [], "system"
+            )
+        ]
+
+        progress = [event for event in events if isinstance(event, ExecutorProgress)]
+        assert progress, "a silent poll loop is what the idle watchdog kills"
+        errors = [event for event in events if isinstance(event, ExecutorError)]
+        assert errors and "handover did not complete" in errors[-1].message
+
+    _run(_test())
+
+
+def test_cancelling_a_turn_interrupts_the_pi_session() -> None:
+    """Cancellation stops Pi instead of leaving it generating.
+
+    ``CancelledError`` is a ``BaseException``, so it bypasses every
+    ``except Exception`` boundary in the turn body. Without an explicit
+    interrupt the subprocess keeps running the abandoned request, and the
+    model call behind it keeps holding the accelerator.
+    """
+
+    async def _test() -> None:
+        executor, rpc = _executor_and_scripted_rpc(
+            [json.dumps({"type": "response", "success": True})]
+        )
+        interrupted: list[str] = []
+
+        async def fake_interrupt(session_key: str) -> bool:
+            interrupted.append(session_key)
+            return True
+
+        executor.interrupt_session = fake_interrupt
+
+        async def read_line(timeout=120.0):
+            del timeout
+            raise asyncio.CancelledError
+
+        rpc.read_line = read_line
+
+        with pytest.raises(asyncio.CancelledError):
+            async for _ in executor.run_turn(
+                [{"role": "user", "content": "review the PR"}], [], "system"
+            ):
+                pass
+
+        assert interrupted, "the Pi session must be interrupted before unwinding"
+
+    _run(_test())
+
+
+def test_a_completed_turn_does_not_interrupt_the_session() -> None:
+    """The interrupt is cancellation-only; a normal turn leaves the session up."""
+
+    async def _test() -> None:
+        executor = _executor_with_scripted_rpc(
+            [
+                json.dumps({"type": "response", "success": True}),
+                json.dumps(
+                    {
+                        "type": "message_update",
+                        "assistantMessageEvent": {
+                            "type": "text_delta",
+                            "delta": "Done.",
+                        },
+                    }
+                ),
+                json.dumps({"type": "agent_end", "messages": []}),
+            ]
+        )
+        interrupted: list[str] = []
+
+        async def fake_interrupt(session_key: str) -> bool:
+            interrupted.append(session_key)
+            return True
+
+        executor.interrupt_session = fake_interrupt
+
+        events = [
+            event
+            async for event in executor.run_turn([{"role": "user", "content": "hi"}], [], "system")
+        ]
+
+        assert any(isinstance(event, TurnComplete) for event in events)
+        assert not interrupted
+
+    _run(_test())
+
+
+# ── fallback handover: do not restart a half-finished task ────
+
+
+def test_a_completed_call_is_recorded_with_its_subject() -> None:
+    calls: dict[str, None] = {}
+    skills: dict[str, None] = {}
+
+    pi_executor._record_completed_call(
+        calls, skills, "sys_os_read", {"path": "/workspace/HomeLab-Forge/ops/compose.yaml"}
+    )
+
+    assert list(calls) == ["sys_os_read(/workspace/HomeLab-Forge/ops/compose.yaml)"]
+
+
+def test_a_repeated_call_is_recorded_once() -> None:
+    calls: dict[str, None] = {}
+    skills: dict[str, None] = {}
+
+    for _ in range(3):
+        pi_executor._record_completed_call(calls, skills, "sys_os_read", {"path": "/a.yaml"})
+
+    assert list(calls) == ["sys_os_read(/a.yaml)"]
+
+
+def test_load_skill_is_recorded_as_a_skill_not_a_call() -> None:
+    calls: dict[str, None] = {}
+    skills: dict[str, None] = {}
+
+    pi_executor._record_completed_call(calls, skills, "load_skill", {"name": "research"})
+
+    assert list(skills) == ["research"]
+    assert list(calls) == []
+
+
+def test_a_long_subject_is_capped() -> None:
+    calls: dict[str, None] = {}
+    skills: dict[str, None] = {}
+
+    pi_executor._record_completed_call(calls, skills, "sys_os_shell", {"command": "x" * 500})
+
+    (only,) = list(calls)
+    assert len(only) < 200
+
+
+def _fallback(**kwargs: object) -> object:
+    return pi_executor._handover_from_compaction(
+        result={"summary": "a progress note"},
+        original_directive="Add Vaultwarden to the productivity stack. Open one PR per repo.",
+        repository_state=None,
+        context_tokens=40000,
+        **kwargs,  # type: ignore[arg-type]
+    )
+
+
+def test_the_fallback_carries_the_directive_verbatim() -> None:
+    handover = _fallback()
+
+    assert handover.mode == "generic"
+    assert "Open one PR per repo" in handover.original_directive
+
+
+def test_the_fallback_does_not_invent_a_phase() -> None:
+    handover = _fallback(last_phase="edit")
+
+    assert handover.phase == "edit", (
+        "asserting investigate here is what sent a half-finished task back to discovery"
+    )
+
+
+def test_the_fallback_still_defaults_when_no_phase_is_known() -> None:
+    assert _fallback().phase == "investigate"
+
+
+def test_the_fallback_populates_do_not_repeat() -> None:
+    handover = _fallback(
+        completed_calls=("sys_os_read(/a.yaml)", "sys_os_read(/b.yaml)"),
+        loaded_skills=("contribute", "research"),
+    )
+
+    assert handover.do_not_repeat == ["sys_os_read(/a.yaml)", "sys_os_read(/b.yaml)"]
+    assert handover.loaded_skills == ["contribute", "research"]
+
+
+def test_the_fallback_points_at_the_directive_not_the_summary() -> None:
+    handover = _fallback()
+
+    assert "directive" in handover.next_action.lower()
+    assert "do_not_repeat" in handover.next_action
+
+
+def test_the_phase_is_derived_from_what_the_turn_actually_ran() -> None:
+    assert pi_executor._infer_phase([]) == "investigate"
+    assert pi_executor._infer_phase(["sys_os_read(/a.yaml)"]) == "investigate"
+    assert pi_executor._infer_phase(["sys_os_read(/a)", "sys_os_write(/b)"]) == "edit"
+    assert (
+        pi_executor._infer_phase(["sys_os_write(/b)", "sys_os_shell(python gh_app_commit.py ...)"])
+        == "commit"
+    )
+    assert (
+        pi_executor._infer_phase(["sys_os_write(/b)", "github__call_tool(create_pull_request)"])
+        == "open_pr"
+    )
+
+
+def test_a_fallback_after_an_edit_does_not_claim_investigate() -> None:
+    handover = _fallback(completed_calls=("sys_os_read(/a)", "sys_os_edit(/b)"))
+
+    assert handover.phase == "edit", (
+        "reporting investigate here is what sent a half-finished task back to discovery"
+    )
+
+
+# ── Pi's own auto-compaction must not race Omnigent's rollover ───
+
+
+def _overlay(enabled: bool, **kw):
+    from omnigent.inner.pi_executor import SmartCompactionConfig, _pi_settings_overlay
+
+    kw.setdefault("trigger_tokens", 56000)
+    return _pi_settings_overlay(
+        {"retry": {"maxRetries": 3}},
+        SmartCompactionConfig(enabled=enabled, **kw),
+    )
+
+
+def test_pi_compaction_is_off_when_omnigent_owns_the_rollover() -> None:
+    overlay = _overlay(True)
+
+    assert overlay["compaction"] == {"enabled": False}, (
+        "Pi compacted at 20684 tokens against a 56000 trigger, so its rollover "
+        "always won and the handover request was never delivered"
+    )
+
+
+def test_pi_compaction_is_left_alone_when_smart_compaction_is_off() -> None:
+    assert "compaction" not in _overlay(False)
+
+
+def test_the_retry_budget_still_rides_along() -> None:
+    for enabled in (True, False):
+        assert _overlay(enabled)["retry"] == {"maxRetries": 3}

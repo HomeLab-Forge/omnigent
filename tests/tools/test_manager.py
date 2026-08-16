@@ -13,6 +13,10 @@ from unittest.mock import patch
 import pytest
 
 from omnigent.errors import OmnigentError
+from omnigent.spec.parser import (
+    FRAMEWORK_TOOL_GROUPS as _FRAMEWORK_TOOL_GROUPS,
+)
+from omnigent.spec.parser import _parse_framework_tools
 from omnigent.spec.types import (
     AgentSpec,
     BuiltinToolConfig,
@@ -1239,3 +1243,97 @@ def test_web_search_does_not_emit_web_search_preview_for_databricks_model() -> N
         f"databricks-gpt-5-4 — Databricks does not support this tool type "
         f"and rejects the request with HTTP 400. Got schema: {schema!r}"
     )
+
+
+# ── framework_tools: declining the auto-registered groups ─────
+
+
+def _framework_names(framework_tools: str | list[str]) -> set[str]:
+    """
+    Tool names a spec advertises for the given ``framework_tools`` value.
+
+    :param framework_tools: The parsed spec value — ``"all"``, ``"none"``,
+        or a list of group names.
+    :returns: Every registered tool name, unfiltered.
+    """
+    spec = AgentSpec(spec_version=1, framework_tools=framework_tools)
+    return {schema["function"]["name"] for schema in ToolManager(spec).get_tool_schemas()}
+
+
+def test_framework_tools_defaults_to_the_surface_we_have_today() -> None:
+    default = _framework_names("all")
+
+    assert default == _framework_names(list(_FRAMEWORK_TOOL_GROUPS)), (
+        "an unset spec and an all-groups spec must be identical"
+    )
+    assert "browser_navigate" in default
+    assert "list_comments" in default
+
+
+@pytest.mark.parametrize("group", sorted(_FRAMEWORK_TOOL_GROUPS))
+def test_a_declined_group_advertises_none_of_its_tools(group: str) -> None:
+    without = _framework_names([g for g in _FRAMEWORK_TOOL_GROUPS if g != group])
+
+    assert not (set(_FRAMEWORK_TOOL_GROUPS[group]) & without)
+
+
+@pytest.mark.parametrize("group", sorted(_FRAMEWORK_TOOL_GROUPS))
+def test_a_selected_group_keeps_every_tool_it_names(group: str) -> None:
+    only = _framework_names([group])
+
+    assert set(_FRAMEWORK_TOOL_GROUPS[group]) <= only
+
+
+def test_none_drops_every_declinable_group() -> None:
+    names = _framework_names("none")
+
+    declinable = {n for group in _FRAMEWORK_TOOL_GROUPS.values() for n in group}
+    assert not (declinable & names)
+
+
+def test_the_unconditional_promises_survive_none() -> None:
+    names = _framework_names("none")
+
+    # sys_cancel_task is named in every dispatched handle's system message,
+    # so it must be in the schema whatever the spec says.
+    assert "sys_cancel_task" in names
+    assert "load_skill" in names
+
+
+def test_the_watchdog_target_surface_is_reachable() -> None:
+    """The ops agent wants oracle + github + sys_os_* + load_skill, nothing else."""
+    spec = AgentSpec(spec_version=1, framework_tools="none", async_enabled=False)
+
+    names = {schema["function"]["name"] for schema in ToolManager(spec).get_tool_schemas()}
+
+    assert names == {"load_skill", "sys_cancel_task"}, (
+        "with no MCP servers, os_env or terminals declared, a headless spec "
+        f"should carry nothing else; got {sorted(names)}"
+    )
+
+
+def test_an_unknown_group_is_rejected_at_parse_time() -> None:
+    with pytest.raises(OmnigentError, match="unknown group"):
+        _parse_framework_tools(["browser", "teleport"])
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        (None, "all"),
+        ("all", "all"),
+        ("none", "none"),
+        ([], "none"),
+        (["browser"], ["browser"]),
+    ],
+)
+def test_framework_tools_accepts_the_same_shapes_as_skills(
+    raw: object, expected: str | list[str]
+) -> None:
+    assert _parse_framework_tools(raw) == expected
+
+
+@pytest.mark.parametrize("raw", [True, 3, {"browser": True}, ["browser", 7]])
+def test_framework_tools_rejects_other_shapes(raw: object) -> None:
+    with pytest.raises(OmnigentError):
+        _parse_framework_tools(raw)

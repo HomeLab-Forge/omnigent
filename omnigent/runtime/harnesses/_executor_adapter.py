@@ -51,6 +51,9 @@ from omnigent.inner.executor import (
     ExecutorConfig,
     ExecutorError,
     ExecutorEvent,
+    ExecutorProgress,
+    LLMCallComplete,
+    LLMCallStarted,
     Message,
     ReasoningChunk,
     TextChunk,
@@ -59,7 +62,11 @@ from omnigent.inner.executor import (
     TurnCancelled,
     TurnComplete,
 )
-from omnigent.inner.tracing import TracingContext, is_tracing_enabled
+from omnigent.inner.tracing import (
+    TracingContext,
+    is_tracing_enabled,
+    llm_generation_name,
+)
 from omnigent.policies.types import FAIL_CLOSED_PHASES
 from omnigent.runtime.harnesses._scaffold import HarnessApp, PolicyVerdictPayload, TurnContext
 from omnigent.runtime.tool_output import cap_tool_output
@@ -72,6 +79,7 @@ from omnigent.server.schemas import (
     ReasoningStartedEvent,
     ReasoningSummaryTextDeltaEvent,
     ReasoningTextDeltaEvent,
+    TraceContextEvent,
 )
 
 _logger = logging.getLogger(__name__)
@@ -110,6 +118,47 @@ _OBSERVED_TOOL_CALL_STATUS = "in_progress"
 _MCP_TOOL_NAME_PREFIX = "mcp__"
 
 
+def _is_terminal_tool_guard_reason(value: object) -> bool:
+    if not isinstance(value, str):
+        return False
+    return (
+        "Loop guard:" in value
+        or ("Stopped after " in value and "failed tool calls" in value and "in this turn" in value)
+        or ("Exceeded the " in value and "-tool budget for this turn" in value)
+    )
+
+
+def _is_terminal_tool_guard_result(result: dict[str, Any]) -> bool:
+    error = result.get("error")
+    if isinstance(error, str):
+        return "Denied by policy" in error and _is_terminal_tool_guard_reason(error)
+    return bool(result.get("denied_by_policy")) and _is_terminal_tool_guard_reason(
+        result.get("reason")
+    )
+
+
+# Bounds on the detached, abnormal-exit executor cleanup scheduled from
+# :meth:`ExecutorAdapter.run_turn`'s finally. The interrupt and the reap
+# (``close_session`` + ``close``) get SEPARATE budgets, NOT one shared deadline:
+# for subprocess-backed executors (ACP, codex, …) the actual terminate/kill of
+# the child happens only in ``close``/``close_session``, so a slow/wedged
+# ``interrupt_session`` must never consume the whole budget and starve the reap
+# — that would orphan the subprocess. The interrupt gets a short best-effort
+# slice; the reap ALWAYS runs afterward under its own cumulative budget. The two
+# sum below the subprocess shutdown grace (~4.5s) so the whole cleanup finishes
+# before a shutdown SIGKILL. ``INTERRUPT_TIMEOUT_S`` is retained as the reap
+# budget (referenced by the shutdown-drain gather too).
+INTERRUPT_TIMEOUT_S = 3.0
+_INTERRUPT_SLICE_S = 1.5
+
+# Number of CONSECUTIVE orphaned tool callbacks (a callback that fired with
+# no active turn context — the symptom of a generation that outlived its
+# turn) tolerated before the per-conversation watchdog forces a Tier-1 SDK
+# reset. Reset to zero at the top of every ``run_turn`` so a single late
+# straggler after a clean turn never trips it.
+_ORPHAN_RESYNC_THRESHOLD = 3
+
+
 def _strip_mcp_tool_prefix(name: str) -> str:
     """
     Strip the Claude SDK MCP tool prefix from a tool name.
@@ -137,6 +186,29 @@ def _strip_mcp_tool_prefix(name: str) -> str:
         if len(parts) == 3:
             return parts[2]
     return name
+
+
+# Prefix of the local host-tool bridge (``sys_os_read`` / ``sys_os_write`` /
+# ``sys_os_edit`` / ``sys_os_shell``). These are the out-of-turn workspace
+# file/shell tools the inner SDK keeps firing AFTER a respawn-driven desync —
+# the #1026 evidence was 88 orphaned ``sys_os_shell`` callbacks in one session.
+# An orphaned host-tool callback is therefore the deterministic signature of a
+# generation that outlived its turn, so it escalates the Tier-1 self-heal on
+# the FIRST occurrence instead of waiting for the consecutive-orphan threshold.
+_HOST_TOOL_PREFIX = "sys_os_"
+
+
+def _is_host_tool(tool_name: str) -> bool:
+    """Whether *tool_name* is a local host-tool-bridge call (``sys_os_*``).
+
+    Accepts both the bare name the MCP-server callback receives and the
+    ``mcp__omnigent__sys_os_*`` wire form, so the check is robust to either
+    callsite.
+
+    :param tool_name: Tool name from the inner SDK's callback.
+    :returns: ``True`` for ``sys_os_*`` host tools.
+    """
+    return _strip_mcp_tool_prefix(tool_name).startswith(_HOST_TOOL_PREFIX)
 
 
 class ExecutorAdapter(HarnessApp):
@@ -200,6 +272,9 @@ class ExecutorAdapter(HarnessApp):
         # deliver.
         self._current_ctx: TurnContext | None = None
         self._current_agent: str | None = None
+        # A terminal loop-guard denial grants the model one final assistant
+        # message for its handoff, then ends the turn before another tool.
+        self._terminal_tool_guard_ctx: TurnContext | None = None
         # FIFO queue of inner-SDK tool-use ids, one entry per
         # ToolCallRequest the executor parses. Populated by
         # :meth:`_translate_event` whenever ``event.metadata``
@@ -222,10 +297,24 @@ class ExecutorAdapter(HarnessApp):
         # suppress-observed mitigation that introduced the
         # end-of-turn ordering regression this queue resolves.
         self._pending_mcp_call_ids: deque[str] = deque()
+        self._pending_tool_traceparents: dict[str, deque[str]] = {}
         # Per-session tracing context. Created lazily on the first
         # turn when tracing is enabled; reused across turns so the
         # span parent chain stays rooted on the session's executor.
         self._tracing_ctx: TracingContext | None = None
+        # Detached, bounded background tasks (currently the abnormal-exit
+        # ``_safe_interrupt`` scheduled from ``run_turn``'s finally). Kept in
+        # a set with a self-discarding done-callback so they're strongly
+        # referenced until completion and drained on shutdown — never awaited
+        # inline, so a wedged interrupt can't block turn teardown.
+        self._bg_tasks: set[asyncio.Task[None]] = set()
+        # Per-conversation orphan-callback watchdog state (P1.8 / P2.10).
+        # ``_orphan_callback_count`` counts CONSECUTIVE tool callbacks that
+        # fired with no active turn context; it's reset at each ``run_turn``
+        # start. ``_resyncing`` guards the Tier-1 reset so concurrent orphans
+        # trigger exactly one reset.
+        self._orphan_callback_count = 0
+        self._resyncing = False
         # Call ids actually round-tripped through :meth:`_stable_tool_executor`
         # -> ``ctx.dispatch_tool`` this turn. ``dispatch_tool`` emits the paired
         # function_call_output itself, so a ToolCallComplete carrying one of
@@ -316,6 +405,7 @@ class ExecutorAdapter(HarnessApp):
             executor._policy_evaluator = self._stable_policy_evaluator  # type: ignore[attr-defined]
         self._current_ctx = ctx
         self._current_agent = request.model
+        self._terminal_tool_guard_ctx = None
         # Reset the MCP call-id queue at turn start. A prior turn
         # that errored mid-stream (e.g. cancelled while a tool_use
         # block had been parsed but its MCP-handler hadn't fired
@@ -325,6 +415,21 @@ class ExecutorAdapter(HarnessApp):
         # previous turn. Clearing makes each turn's correlation
         # window self-contained.
         self._pending_mcp_call_ids.clear()
+        self._pending_tool_traceparents.clear()
+        # A fresh turn binding clears the orphan-callback watchdog: whatever
+        # stragglers fired before this turn started are now moot, and the
+        # tier-1 reset condition is "N orphans with NO intervening clean
+        # turn" (P1.8). Reset here so the counter measures only post-bind
+        # orphans.
+        self._orphan_callback_count = 0
+        # Set True immediately before each genuine-completion return so the
+        # finally can distinguish a clean exit (TurnComplete / handled
+        # cancellation) from an abnormal one (CancelledError unwinding the
+        # task, ExecutorError, transport drop). On an abnormal exit the
+        # cached inner-SDK generation may still be live and would later
+        # flush queued tool_use as orphaned callbacks — so we schedule a
+        # bounded interrupt (P0.2).
+        clean_exit = False
         self._dispatched_call_ids.clear()
 
         # --- Tracing setup ------------------------------------------------
@@ -335,20 +440,92 @@ class ExecutorAdapter(HarnessApp):
         tracing = is_tracing_enabled()
         from omnigent.runtime.telemetry import current_session_id, session_scope
 
-        # Prefer the conversation id the request hook already bound
-        # (authoritative, from the /sessions/<conv>/events path); fall back to
-        # the adapter session key, which can be a random uuid for harnesses
-        # built without one.
-        turn_session_id = current_session_id() or self._session_key
+        # The route-owned conversation id is authoritative even when FastAPI
+        # auto-instrumentation is disabled. Older callers fall back to the
+        # ambient context and finally the adapter's private SDK session key.
+        turn_session_id = ctx.conversation_id or current_session_id() or self._session_key
         if tracing and self._tracing_ctx is None:
             self._tracing_ctx = TracingContext(session_id=turn_session_id)
         tctx = self._tracing_ctx if tracing else None
         agent_span = None
+        llm_span = None
+        llm_parent = None
+        llm_reasoning_parts: list[str] = []
+        llm_response_parts: list[str] = []
+        llm_span_count = 0
         # Active tool span for correlating ToolCallRequest → ToolCallComplete.
         _active_tool_span = None
         _active_tool_parent = None
 
         user_message = _extract_last_user_message(request.input)
+        llm_fallback_input: Any = (
+            [{"role": "user", "content": user_message}] if user_message else None
+        )
+
+        def _start_llm_trace(
+            model: str | None = None,
+            input_value: Any = None,
+        ) -> None:
+            nonlocal llm_fallback_input, llm_parent, llm_span, llm_span_count
+            if tctx is None or llm_span is not None:
+                return
+            resolved_model = model or request.model_override or request.model
+            traced_input = input_value if input_value is not None else llm_fallback_input
+            llm_parent = tctx._current_span
+            llm_span = tctx.start_llm_span(
+                model=resolved_model,
+                name=llm_generation_name(resolved_model),
+                input_value=traced_input,
+            )
+            llm_fallback_input = None
+            llm_reasoning_parts.clear()
+            llm_response_parts.clear()
+            llm_span_count += 1
+
+        def _end_llm_trace(
+            *,
+            usage: dict[str, Any] | None = None,
+            response: str | None = None,
+            reasoning: str | None = None,
+            error: str | None = None,
+        ) -> None:
+            nonlocal llm_parent, llm_span
+            if tctx is None or llm_span is None:
+                return
+            traced_reasoning = "".join(llm_reasoning_parts) or reasoning
+            traced_response = "".join(llm_response_parts) or response
+            tctx.end_llm_span(
+                llm_span,
+                reasoning=traced_reasoning,
+                response=traced_response,
+                usage=usage,
+                error=error,
+                parent_span=llm_parent,
+            )
+            llm_span = None
+            llm_parent = None
+            llm_reasoning_parts.clear()
+            llm_response_parts.clear()
+
+        def _end_tool_trace(
+            *,
+            result: Any = None,
+            error: str | None = None,
+            duration_ms: float = 0.0,
+        ) -> None:
+            nonlocal _active_tool_parent, _active_tool_span
+            if tctx is None or _active_tool_span is None:
+                return
+            tctx.end_tool_span(
+                _active_tool_span,
+                result=result,
+                error=error,
+                duration_ms=duration_ms,
+                parent_span=_active_tool_parent,
+            )
+            _active_tool_span = None
+            _active_tool_parent = None
+
         # --- End tracing setup --------------------------------------------
 
         # Watcher for mid-turn steering injections. The scaffold
@@ -390,8 +567,19 @@ class ExecutorAdapter(HarnessApp):
                         user_message=user_message,
                         model=request.model_override or request.model,
                     )
+                    from omnigent.runtime.telemetry import traceparent_for_span
+
+                    agent_traceparent = traceparent_for_span(agent_span)
+                    if agent_traceparent is not None:
+                        ctx.emit(
+                            TraceContextEvent(
+                                type="trace_context.available",
+                                traceparent=agent_traceparent,
+                            )
+                        )
 
                 response_text: str | None = None
+                guard_handoff_text_seen = False
                 async for event in executor.run_turn(
                     messages=messages,
                     tools=tools,
@@ -402,55 +590,163 @@ class ExecutorAdapter(HarnessApp):
                         if tctx is not None and agent_span is not None:
                             from omnigent.runtime.telemetry import record_cancellation
 
+                            if llm_span is not None:
+                                record_cancellation(llm_span)
+                                _end_llm_trace()
+                            if _active_tool_span is not None:
+                                record_cancellation(_active_tool_span)
+                                _end_tool_trace()
                             record_cancellation(agent_span)
                             tctx.end_agent_span(agent_span, response=None)
                             agent_span = None
+                        # Interrupt the inner session inline. Mark the exit
+                        # clean ONLY AFTER the interrupt actually completes — if
+                        # the inline interrupt raises, clean_exit stays False so
+                        # the finally's detached, bounded _safe_interrupt
+                        # fallback still fires (P0.2). Setting clean_exit before
+                        # the await would skip the fallback on a failed inline
+                        # interrupt, leaving the generation abandoned.
                         await executor.interrupt_session(self._session_key)
+                        clean_exit = True
+                        return
+                    guard_handoff_active = self._terminal_tool_guard_ctx is ctx
+                    if guard_handoff_active and isinstance(event, TextChunk):
+                        if event.text.strip():
+                            guard_handoff_text_seen = True
+                    if guard_handoff_active and isinstance(event, LLMCallComplete):
+                        if (
+                            not guard_handoff_text_seen
+                            and isinstance(event.response, str)
+                            and event.response.strip()
+                        ):
+                            ctx.emit(
+                                OutputTextDeltaEvent(
+                                    type="response.output_text.delta",
+                                    delta=event.response,
+                                )
+                            )
+                            guard_handoff_text_seen = True
+                    if guard_handoff_active and isinstance(event, ToolCallRequest):
+                        if guard_handoff_text_seen:
+                            continue
+                        ctx.cancelled.set()
+                        await executor.interrupt_session(self._session_key)
+                        clean_exit = True
                         return
                     # --- Tracing: emit spans per event ---
                     if tctx is not None:
-                        if isinstance(event, ToolCallRequest):
+                        if isinstance(event, LLMCallStarted):
+                            _end_llm_trace()
+                            _start_llm_trace(event.model, event.input)
+                        elif isinstance(event, ReasoningChunk):
+                            _start_llm_trace()
+                            if event.delta:
+                                llm_reasoning_parts.append(event.delta)
+                        elif isinstance(event, TextChunk):
+                            _start_llm_trace()
+                            llm_response_parts.append(event.text)
+                        elif isinstance(event, LLMCallComplete):
+                            _start_llm_trace(event.model)
+                            _end_llm_trace(
+                                usage=event.usage,
+                                response=event.response,
+                                reasoning=event.reasoning,
+                                error=event.error,
+                            )
+                        elif isinstance(event, ToolCallRequest):
+                            _end_llm_trace()
                             _active_tool_parent = tctx._current_span
                             _active_tool_span = tctx.start_tool_span(
                                 _strip_mcp_tool_prefix(event.name),
                                 event.args or {},
                             )
+                            from omnigent.runtime.telemetry import traceparent_for_span
+
+                            tool_traceparent = traceparent_for_span(_active_tool_span)
+                            if tool_traceparent is not None:
+                                bare_name = _strip_mcp_tool_prefix(event.name)
+                                self._pending_tool_traceparents.setdefault(
+                                    bare_name,
+                                    deque(),
+                                ).append(tool_traceparent)
                         elif isinstance(event, ToolCallComplete):
-                            if _active_tool_span is not None:
-                                tctx.end_tool_span(
-                                    _active_tool_span,
-                                    result=event.result,
-                                    error=event.error,
-                                    duration_ms=event.duration_ms,
-                                    parent_span=_active_tool_parent,
-                                )
-                                _active_tool_span = None
-                                _active_tool_parent = None
+                            _end_tool_trace(
+                                result=event.result,
+                                error=event.error,
+                                duration_ms=event.duration_ms,
+                            )
+                            llm_fallback_input = [
+                                {
+                                    "role": "tool",
+                                    "name": _strip_mcp_tool_prefix(event.name),
+                                    "content": event.result,
+                                    "error": event.error or None,
+                                }
+                            ]
                         elif isinstance(event, TurnComplete):
                             response_text = event.response
-                            if event.usage is not None and agent_span is not None:
-                                from omnigent.runtime.telemetry import record_llm_usage
-
-                                # Record usage on the agent span for
-                                # aggregate visibility.
-                                record_llm_usage(agent_span, event.usage)
+                            if llm_span is not None:
+                                _end_llm_trace(
+                                    usage=event.usage,
+                                    response=event.response,
+                                )
+                            elif llm_span_count == 0 and event.usage is not None:
+                                _start_llm_trace()
+                                _end_llm_trace(
+                                    usage=event.usage,
+                                    response=event.response,
+                                )
                     # --- End tracing ---
                     self._translate_event(event, ctx)
+                    if (
+                        self._terminal_tool_guard_ctx is ctx
+                        and isinstance(event, LLMCallComplete)
+                        and guard_handoff_text_seen
+                    ):
+                        _logger.warning(
+                            "tool loop handoff completed for response %s; "
+                            "ending the active generation",
+                            ctx.response_id,
+                        )
+                        self._terminal_tool_guard_ctx = None
+                        await executor.interrupt_session(self._session_key)
+                        clean_exit = True
+                        return
                     if isinstance(event, TurnComplete):
                         if tctx is not None and agent_span is not None:
+                            _end_tool_trace(error="tool call did not complete before turn end")
                             tctx.end_agent_span(agent_span, response=response_text)
                             agent_span = None
+                        # The inner generation reached its natural end — no
+                        # abandoned stream to interrupt.
+                        clean_exit = True
                         return
                     if isinstance(event, TurnCancelled):
                         ctx.cancelled.set()
                         if tctx is not None and agent_span is not None:
                             from omnigent.runtime.telemetry import record_cancellation
 
+                            if llm_span is not None:
+                                record_cancellation(llm_span)
+                                _end_llm_trace()
+                            if _active_tool_span is not None:
+                                record_cancellation(_active_tool_span)
+                                _end_tool_trace()
                             record_cancellation(agent_span)
-                            tctx.end_agent_span(agent_span, response=None)
+                            # #1026: mark the cancelled turn's agent span ERROR.
+                            # Upstream refactored end_agent_span (dropped the
+                            # ``status=`` kwarg); ERROR status is now driven by a
+                            # truthy ``error=``, so route the cancellation through it.
+                            tctx.end_agent_span(agent_span, response=None, error="cancelled")
+                            agent_span = None
+                        # The inner executor reported its own cancellation; the
+                        # generation is already wound down, so treat as clean.
+                        clean_exit = True
                         return
                     if isinstance(event, ExecutorError):
                         if tctx is not None and agent_span is not None:
+                            _end_llm_trace(error=event.message)
+                            _end_tool_trace(error=event.message)
                             tctx.end_agent_span(
                                 agent_span,
                                 response=None,
@@ -472,8 +768,15 @@ class ExecutorAdapter(HarnessApp):
             if tctx is not None and agent_span is not None:
                 from omnigent.runtime.telemetry import record_cancellation
 
+                if llm_span is not None:
+                    record_cancellation(llm_span)
+                    _end_llm_trace()
+                if _active_tool_span is not None:
+                    record_cancellation(_active_tool_span)
+                    _end_tool_trace()
                 record_cancellation(agent_span)
                 tctx.end_agent_span(agent_span, response=None)
+                agent_span = None
             ctx.cancelled.set()
             # Interrupt the inner executor session so the in-flight
             # generation stops immediately, same as the normal
@@ -484,6 +787,8 @@ class ExecutorAdapter(HarnessApp):
             # End agent span on unhandled exceptions so it's not
             # left open (which would leak on the OTel provider).
             if tctx is not None and agent_span is not None:
+                _end_llm_trace(error="unhandled exception")
+                _end_tool_trace(error="unhandled exception")
                 tctx.end_agent_span(agent_span, response=None, error="unhandled exception")
                 agent_span = None
             raise
@@ -515,8 +820,44 @@ class ExecutorAdapter(HarnessApp):
             # (e.g. one fired after the SDK's stream closed) sees
             # ``None`` and returns an explicit error rather than
             # silently dispatching into the just-finished ctx.
-            self._current_ctx = None
-            self._current_agent = None
+            #
+            # Compare-and-clear (identity CAS): only null the slot when it
+            # still points at THIS turn's ctx. A stale finally — e.g. turn A
+            # unwinding late while turn B has already bound ``_current_ctx``
+            # to itself — must NOT clobber B's slot, or B's tool callbacks
+            # would orphan on a None ctx ("no active turn context"). Mirrors
+            # the scaffold's ``if self._active_turn_ctx is ctx`` guards.
+            if self._current_ctx is ctx:
+                self._current_ctx = None
+                self._current_agent = None
+            if self._terminal_tool_guard_ctx is ctx:
+                self._terminal_tool_guard_ctx = None
+            # P0.2: on an abnormal exit (CancelledError unwinding the task,
+            # ExecutorError, transport drop) the cached inner-SDK generation
+            # may still be live and would later flush queued tool_use as
+            # orphaned callbacks. SCHEDULE a bounded interrupt — never await
+            # it inline, or a wedged subprocess would block turn teardown and
+            # leak the run_task the verdict future is parked under. The task
+            # is strongly referenced via ``_bg_tasks`` (drained on shutdown)
+            # and self-discards on completion.
+            #
+            # DETACH the executor SYNCHRONOUSLY here, before scheduling the
+            # background interrupt: a buffered continuation can start a new
+            # turn the instant this finally returns. If we left the abandoned
+            # executor cached, that new turn's ``_ensure_executor`` would reuse
+            # the SAME inner client and session_key — and the still-pending
+            # ``interrupt_session`` would then kill the NEW generation (or the
+            # new turn would attach to the abandoned stream). Nulling
+            # ``self._executor`` now forces the next turn to rebuild a fresh
+            # client; the detached instance is interrupted + closed off-thread.
+            if not clean_exit:
+                abandoned_executor = self._executor
+                self._executor = None
+                interrupt_task = asyncio.create_task(
+                    self._safe_interrupt(abandoned_executor, self._session_key)
+                )
+                self._bg_tasks.add(interrupt_task)
+                interrupt_task.add_done_callback(self._bg_tasks.discard)
 
     async def _handle_interrupt_event(self) -> Response:
         """Cancel the turn AND drop the inner executor session.
@@ -543,6 +884,151 @@ class ExecutorAdapter(HarnessApp):
         if self._executor is not None:
             await self._executor.interrupt_session(self._session_key)
         return response
+
+    async def _safe_interrupt(self, executor: Executor | None, session_key: str) -> None:
+        """Best-effort, bounded interrupt + close of an abandoned generation.
+
+        Scheduled (never awaited inline) from :meth:`run_turn`'s finally on
+        an abnormal exit so a cached inner-SDK generation that outlived its
+        turn can't later flush queued ``tool_use`` blocks as orphaned
+        callbacks. Operates on the executor instance *detached* by the caller
+        (``self._executor`` is already nulled) — NOT on ``self._executor``,
+        which a fresh continuation turn may have already rebuilt; interrupting
+        that one would kill the new generation. ``interrupt_session`` drops the
+        live client, then ``close``/``close_session`` reaps the abandoned
+        subprocess so it doesn't leak now that nothing else references it.
+
+        The interrupt gets a short :data:`_INTERRUPT_SLICE_S` best-effort slice;
+        the reap (``close_session`` + ``close``) then ALWAYS runs under its own
+        :data:`INTERRUPT_TIMEOUT_S` cumulative budget — a slow/wedged interrupt
+        can NEVER starve the reap. This matters because subprocess-backed
+        executors (ACP, codex, …) perform the real child terminate/kill only in
+        ``close``/``close_session``; a starved reap would orphan the subprocess.
+        Both budgets are bounded (and sum below the subprocess shutdown grace) so
+        the task always terminates and the shutdown drain in :meth:`close` (which
+        gathers ``_bg_tasks``) can't stall. Swallows every failure — a failed step
+        is logged, not raised, because there is no turn context left to surface it
+        to and the per-conversation watchdog is the next line of defence.
+
+        :param executor: The detached inner executor to interrupt, or ``None``
+            (no executor was ever built — nothing to do).
+        :param session_key: The inner executor session key to interrupt.
+        """
+        if executor is None:
+            return
+
+        # The interrupt gets a short best-effort SLICE — bounded so it can't hang
+        # the task, but capped WELL BELOW the total so it cannot starve the reap.
+        try:
+            await asyncio.wait_for(
+                executor.interrupt_session(session_key), timeout=_INTERRUPT_SLICE_S
+            )
+        except Exception:  # best-effort: a failed/timed-out interrupt is logged, not raised
+            _logger.error(
+                "abnormal-exit interrupt of inner session %s failed or timed out",
+                session_key,
+                exc_info=True,
+            )
+
+        # The reap ALWAYS runs, under its OWN cumulative budget — even if the
+        # interrupt above consumed its whole slice. For subprocess-backed
+        # executors (ACP, codex, …) close_session/close perform the real
+        # terminate/kill of the child, so skipping them would orphan the
+        # subprocess. One cumulative budget across both closes keeps it bounded.
+        async def _reap() -> None:
+            with contextlib.suppress(Exception):
+                await executor.close_session(session_key)
+            with contextlib.suppress(Exception):
+                await executor.close()
+
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(_reap(), timeout=INTERRUPT_TIMEOUT_S)
+
+    async def _maybe_resync_on_orphan(self, *, force: bool = False) -> None:
+        """Tier-1 per-conversation SDK reset after repeated orphan callbacks.
+
+        Fires once the consecutive-orphan counter crosses
+        :data:`_ORPHAN_RESYNC_THRESHOLD` (reset to zero at every ``run_turn``
+        start, so it measures orphans with no intervening clean turn) — OR
+        immediately when *force* is set. Drops the cached inner executor —
+        forcing the next turn to rebuild a fresh client — and clears every
+        stale turn slot under :attr:`_lock` so no further callback can dispatch
+        into a dead ctx.
+
+        ``force=True`` is passed for an orphaned HOST-tool (``sys_os_*``)
+        callback (#1026 gap 2): a host-tool orphan is the deterministic
+        signature of a generation that outlived its turn after a respawn, so
+        the executor is dropped on the FIRST one — interrupting the abandoned
+        generation at its source — rather than letting it flush dozens of
+        ``sys_os_shell`` orphans (the 88x storm in the issue evidence) until
+        the threshold trips. Without this, an out-of-turn host-tool dispatch
+        would keep returning the desync error for the rest of the session.
+
+        Idempotent under concurrency: the :attr:`_resyncing` guard plus the
+        threshold/force check ensure a burst of simultaneous orphans triggers
+        exactly ONE reset (the rest observe ``_resyncing`` or the
+        zeroed counter and no-op).
+
+        Tier-2 (terminating the conversation's subprocess) is intentionally
+        NOT done here: the adapter runs *inside* that subprocess and has no
+        handle on the runner's process manager. The runner owns that
+        escalation via ``_resync_turn_state`` → ``_cancel_inprocess_turn``.
+
+        :param force: Drop the executor on this orphan regardless of the
+            consecutive-orphan count (set for host-tool orphans).
+        """
+        if not force and self._orphan_callback_count < _ORPHAN_RESYNC_THRESHOLD:
+            return
+        if self._resyncing:
+            return
+        self._resyncing = True
+        try:
+            async with self._lock:
+                # Re-check under the lock: a concurrent reset may have already
+                # zeroed the counter while we awaited the lock. ``force`` skips
+                # the count gate (a single host-tool orphan must still reset).
+                if not force and self._orphan_callback_count < _ORPHAN_RESYNC_THRESHOLD:
+                    return
+                _logger.error(
+                    "runner_turn_context_desync: %d consecutive orphan callbacks; "
+                    "forcing Tier-1 SDK reset for session %s",
+                    self._orphan_callback_count,
+                    self._session_key,
+                )
+                executor = self._executor
+                self._executor = None
+                self._current_ctx = None
+                self._current_agent = None
+                # Deliberately do NOT touch ``self._in_flight`` or
+                # ``self._active_turn_ctx``: those are owned by the scaffold's
+                # ``_start_or_inject_turn``/``_teardown_turn`` and back the
+                # registry ``_handle_tool_result_event`` uses to resolve pending
+                # tool futures. Clearing them here strands tool results — a slow
+                # but legit result arriving after this reset would find no entry
+                # and its awaiting Future would hang forever (Mode A); and a NEW
+                # turn registered while ``_current_ctx is None`` would have its
+                # fresh entry wiped, hanging all its dispatches (Mode B). The
+                # adapter's stable callbacks already guard on ``_current_ctx``,
+                # so dropping the executor + current binding is sufficient.
+                self._orphan_callback_count = 0
+            # Close the dropped executor outside the lock — close_session can
+            # block on subprocess teardown and must not stall route handlers
+            # waiting on _lock. ONE cumulative deadline across both close calls
+            # (not two sequential budgets) so a wedged close can't hang the reset
+            # past the subprocess shutdown grace; best-effort — a failed/timed-out
+            # close must not raise out.
+            if executor is not None:
+
+                async def _close(exc: Executor = executor) -> None:
+                    with contextlib.suppress(Exception):
+                        await exc.close_session(self._session_key)
+                    with contextlib.suppress(Exception):
+                        await exc.close()
+
+                with contextlib.suppress(Exception):
+                    await asyncio.wait_for(_close(), timeout=INTERRUPT_TIMEOUT_S)
+        finally:
+            self._resyncing = False
 
     async def _watch_injections(self, ctx: TurnContext, executor: Executor) -> None:
         """
@@ -658,11 +1144,40 @@ class ExecutorAdapter(HarnessApp):
         ctx = self._current_ctx
         agent = self._current_agent
         if ctx is None or agent is None:
-            _logger.warning(
-                "tool callback fired with no active turn context (tool=%s); returning error",
+            # P2.10: an orphaned tool callback (the cached generation
+            # outlived its turn). SAFE-FAIL — hard-return a structured error,
+            # never rebind into a stale ctx (that would park a Future nobody
+            # can resolve and hang the SDK). The distinct
+            # ``runner_turn_context_desync`` code lets the AP-side L2
+            # classifier treat it as a non-retryable-forever desync (P2.11)
+            # rather than looping.
+            self._orphan_callback_count += 1
+            # An out-of-turn host-tool (``sys_os_*``) callback is the
+            # deterministic respawn-desync signature, so force the Tier-1 reset
+            # on the FIRST one — dropping the abandoned generation at its source
+            # rather than erroring for the rest of the session (the 88x
+            # ``sys_os_shell`` storm). Non-host orphans keep the
+            # consecutive-count gate so a single late straggler never resets.
+            #
+            # But only when the SCAFFOLD also has no live turn. ``run_turn``'s
+            # finally clears ``_current_ctx`` before ``_teardown_turn`` clears
+            # ``_active_turn_ctx``, so a callback landing in that window is a
+            # healthy turn winding down, not an abandoned generation — forcing a
+            # reset there would drop a live session's SDK client.
+            host_tool = _is_host_tool(tool_name) and self._active_turn_ctx is None
+            _logger.error(
+                "runner_turn_context_desync: tool callback fired with no active "
+                "turn context (tool=%s, host_tool=%s, consecutive_orphans=%d); "
+                "returning error",
                 tool_name,
+                host_tool,
+                self._orphan_callback_count,
             )
-            return {"error": "no active turn context for tool dispatch"}
+            await self._maybe_resync_on_orphan(force=host_tool)
+            return {
+                "error": "no active turn context for tool dispatch",
+                "code": "runner_turn_context_desync",
+            }
         # Pop the matching ``tool_use_id`` for MCP tools so the
         # dispatch reuses the observed event's call_id. Non-MCP
         # tools and out-of-order edge cases (queue empty when an
@@ -689,13 +1204,26 @@ class ExecutorAdapter(HarnessApp):
         # completions (not in this set) through as the sole output source.
         dispatch_call_id = correlated_call_id or f"call_{uuid.uuid4().hex[:12]}"
         self._dispatched_call_ids.add(dispatch_call_id)
-        return await _bridge_one_dispatch(
+        trace_key = _strip_mcp_tool_prefix(tool_name)
+        traceparents = self._pending_tool_traceparents.get(trace_key)
+        traceparent = traceparents.popleft() if traceparents else None
+        if traceparents is not None and not traceparents:
+            self._pending_tool_traceparents.pop(trace_key, None)
+        result = await _bridge_one_dispatch(
             ctx,
             agent,
             tool_name,
             args,
             call_id=dispatch_call_id,
+            traceparent=traceparent,
         )
+        if _is_terminal_tool_guard_result(result):
+            _logger.warning(
+                "tool loop guard triggered for response %s; requesting a final handoff",
+                ctx.response_id,
+            )
+            self._terminal_tool_guard_ctx = ctx
+        return result
 
     async def _stable_elicitation_handler(
         self,
@@ -792,21 +1320,30 @@ class ExecutorAdapter(HarnessApp):
         """
         ctx = self._current_ctx
         if ctx is None:
-            # Orphaned callback after a turn-context desync (#1026). Blanket
-            # ALLOW here silently bypasses guardrails: for a PHASE_TOOL_CALL this
-            # adapter is the only enforcement point (the call is never re-checked
-            # server-side), so an unevaluable verdict must fail closed. Mirror
-            # the runner's phase-aware default in _evaluate_policy_via_omnigent —
-            # tool calls DENY; advisory LLM phases and the post-execution result
-            # phase ALLOW so a transient desync never needlessly wedges them.
+            # P1.6: a policy evaluator that fires with no active turn context
+            # is a desync (the generation outlived its turn). Fail CLOSED for
+            # the authoritative tool-call gate — for connector-native MCP
+            # tools this round-trip is the ONLY enforcement point, so an
+            # unevaluable verdict must DENY rather than silently let the call
+            # through. Advisory LLM phases and PHASE_TOOL_RESULT (the tool
+            # already ran) stay ALLOW so a stray late callback never wedges.
             fail_closed = phase in FAIL_CLOSED_PHASES
             action = "POLICY_ACTION_DENY" if fail_closed else "POLICY_ACTION_ALLOW"
-            _logger.warning(
-                "policy evaluator fired with no active turn context (phase=%s); "
-                "returning %s by default",
+            # P1.8: a missing-context policy callback is an orphaned None-slot
+            # callback just like the tool-callback case — count it toward the
+            # same consecutive-orphan watchdog so a generation that keeps
+            # flushing policy callbacks after its turn ended triggers the same
+            # Tier-1 SDK reset. The fail-closed DENY above still stands for this
+            # individual call.
+            self._orphan_callback_count += 1
+            _logger.error(
+                "runner_turn_context_desync: policy evaluator fired with no active "
+                "turn context (phase=%s, consecutive_orphans=%d); defaulting to %s",
                 phase,
-                "DENY" if fail_closed else "ALLOW",
+                self._orphan_callback_count,
+                action,
             )
+            await self._maybe_resync_on_orphan()
             return PolicyVerdictPayload(
                 action=action,
                 reason=(
@@ -814,7 +1351,18 @@ class ExecutorAdapter(HarnessApp):
                 ),
             )
         evaluation_id = f"poleval_{secrets.token_hex(16)}"
-        return await ctx.evaluate_policy(evaluation_id, phase, data)
+        verdict = await ctx.evaluate_policy(evaluation_id, phase, data)
+        if (
+            phase == "PHASE_TOOL_CALL"
+            and verdict.action == "POLICY_ACTION_DENY"
+            and _is_terminal_tool_guard_reason(verdict.reason)
+        ):
+            _logger.warning(
+                "native tool loop guard triggered for response %s; requesting a final handoff",
+                ctx.response_id,
+            )
+            self._terminal_tool_guard_ctx = ctx
+        return verdict
 
     def _ensure_executor(self) -> Executor:
         """
@@ -843,7 +1391,9 @@ class ExecutorAdapter(HarnessApp):
         :param ctx: The per-turn context; events are pushed onto
             its queue.
         """
-        if isinstance(event, TextChunk):
+        if isinstance(event, ExecutorProgress):
+            ctx.mark_progress()
+        elif isinstance(event, TextChunk):
             ctx.emit(
                 OutputTextDeltaEvent(
                     type="response.output_text.delta",
@@ -1032,6 +1582,8 @@ class ExecutorAdapter(HarnessApp):
                     summary=event.summary,
                     summary_model=event.model,
                     compacted_messages=event.compacted_messages,
+                    handover=event.handover,
+                    handover_loaded=event.handover_loaded,
                 )
             )
         # ExecutorError handled by the caller (re-raises so the
@@ -1112,6 +1664,13 @@ class ExecutorAdapter(HarnessApp):
         processes (e.g. ``claude --output-format``) are reaped
         rather than orphaned.
         """
+        # Drain any scheduled abnormal-exit interrupts BEFORE closing the
+        # executor so they run against a live session; each is bounded by
+        # INTERRUPT_TIMEOUT_S, so this can't hang teardown. ``return_exceptions``
+        # keeps a single failed interrupt from aborting the drain.
+        if self._bg_tasks:
+            await asyncio.gather(*list(self._bg_tasks), return_exceptions=True)
+            self._bg_tasks.clear()
         if self._executor is not None:
             await self._executor.close_session(self._session_key)
             await self._executor.close()
@@ -1432,6 +1991,7 @@ async def _bridge_one_dispatch(
     args: dict[str, Any],
     *,
     call_id: str | None = None,
+    traceparent: str | None = None,
 ) -> dict[str, Any]:
     """
     Round-trip one tool call through ``ctx.dispatch_tool``.
@@ -1456,6 +2016,7 @@ async def _bridge_one_dispatch(
         freshly-allocated uuid — the dispatch still works but the
         observed and action_required events render as separate
         ``⏵ tool_name`` lines.
+    :param traceparent: W3C context for the active tool span.
     :returns: A dict suitable as the MCP tool result.
     """
     import json
@@ -1463,12 +2024,21 @@ async def _bridge_one_dispatch(
     if call_id is None:
         call_id = f"call_{uuid.uuid4().hex[:12]}"
     try:
-        output = await ctx.dispatch_tool(
-            call_id=call_id,
-            name=tool_name,
-            arguments=json.dumps(args),
-            agent=agent,
-        )
+        if traceparent is None:
+            output = await ctx.dispatch_tool(
+                call_id=call_id,
+                name=tool_name,
+                arguments=json.dumps(args),
+                agent=agent,
+            )
+        else:
+            output = await ctx.dispatch_tool(
+                call_id=call_id,
+                name=tool_name,
+                arguments=json.dumps(args),
+                agent=agent,
+                traceparent=traceparent,
+            )
     except Exception as exc:
         _logger.exception("dispatch_tool failed for %s", tool_name)
         return {"error": str(exc)}
