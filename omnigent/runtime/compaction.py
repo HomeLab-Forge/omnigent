@@ -44,6 +44,12 @@ _BINARY_CONTENT_CLEARED = (
     "[binary content removed for context management — use file_id to retrieve]"
 )
 
+# Tools whose output is durable operating context rather than a transient
+# result. Clearing these tells the agent to re-call the tool to get its own
+# instructions back, and the second identical call is what the repeated-call
+# guard latches on — so the agent loses the skill AND the turn.
+_DURABLE_OUTPUT_TOOLS = frozenset({"load_skill"})
+
 # Default compaction settings when AgentSpec.compaction is None.
 _DEFAULT_TRIGGER_THRESHOLD: float = 0.8
 _DEFAULT_RECENT_WINDOW: int = 5
@@ -195,9 +201,33 @@ def _find_recent_boundary(
     return 0
 
 
+def _durable_output_call_ids(messages: list[dict[str, Any]]) -> set[str]:
+    """
+    Collect the call ids whose tool output must survive clearing.
+
+    :param messages: The messages list to scan.
+    :returns: Call ids belonging to a ``function_call`` naming a tool in
+        :data:`_DURABLE_OUTPUT_TOOLS`, e.g. ``{"call_ab12"}``.
+    """
+    ids: set[str] = set()
+    for msg in messages:
+        if msg.get("type") != "function_call":
+            continue
+        if msg.get("name") not in _DURABLE_OUTPUT_TOOLS:
+            continue
+        # ``history_to_input_items`` writes ``call_id``; some callers carry the
+        # id as ``id``. Accept either so the pairing can't silently miss.
+        call_id = msg.get("call_id") or msg.get("id")
+        if isinstance(call_id, str):
+            ids.add(call_id)
+    return ids
+
+
 def _clear_tool_results(
     messages: list[dict[str, Any]],
     protect_from: int,
+    *,
+    keep_durable: bool = True,
 ) -> list[dict[str, Any]]:
     """
     Replace tool result bodies outside the recent window with a
@@ -212,13 +242,22 @@ def _clear_tool_results(
     :param protect_from: Index of the first message in the recent
         window. Messages at indices < *protect_from* are eligible
         for clearing.
+    :param keep_durable: Leave :data:`_DURABLE_OUTPUT_TOOLS` outputs
+        intact. True for the prompt the agent runs on, so a loaded skill
+        stays loaded. False for the Layer 2 summarization input, which is
+        read once by the summarizer and pays full token price for text the
+        summary is about to condense.
     :returns: The same list (modified in place) for convenience.
     """
+    durable = _durable_output_call_ids(messages) if keep_durable else set()
     for i, msg in enumerate(messages):
         if i >= protect_from:
             break
-        if msg.get("type") == "function_call_output":
-            msg["output"] = _TOOL_RESULT_CLEARED
+        if msg.get("type") != "function_call_output":
+            continue
+        if msg.get("call_id") in durable:
+            continue
+        msg["output"] = _TOOL_RESULT_CLEARED
     return messages
 
 
@@ -846,7 +885,7 @@ async def _run_layer2(
     # summarization input too.
     if count_tokens(to_summarize, model) > budget:
         to_summarize = _deep_copy_messages(to_summarize)
-        _clear_tool_results(to_summarize, len(to_summarize))
+        _clear_tool_results(to_summarize, len(to_summarize), keep_durable=False)
         _clear_binary_content(to_summarize, len(to_summarize))
 
     try:

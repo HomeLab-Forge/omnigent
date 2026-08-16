@@ -9,6 +9,15 @@ from omnigent.spec.types import SkillSpec
 from omnigent.tools.base import Tool, ToolContext
 from omnigent.tools.builtins._arguments import parse_json_object_arguments
 
+# Prefix for a repeat load. The instructions are returned again rather than
+# withheld: a skill lives only as this tool's output in the transcript, so a
+# second call is how the agent recovers it after compaction, not a mistake.
+# What the note prevents is the agent reading the reload as progress.
+_ALREADY_LOADED = (
+    "[Already loaded earlier in this session. The full instructions are "
+    "repeated below — re-loading a skill does not advance the task.]"
+)
+
 
 class LoadSkillTool(Tool):
     """
@@ -57,6 +66,9 @@ class LoadSkillTool(Tool):
                 all_skills.append(hs)
         self._skills = all_skills
         self._skills_by_name: dict[str, SkillSpec] = {s.name: s for s in all_skills}
+        # Skill names already served, per conversation. Bounded by the skill
+        # catalogue, and the tool instance lives for one runner's lifetime.
+        self._loaded_by_conversation: dict[str, set[str]] = {}
 
     @property
     def skills(self) -> list[SkillSpec]:
@@ -116,10 +128,15 @@ class LoadSkillTool(Tool):
         If the skill has bundled resource files, appends
         a listing of available files to the content.
 
+        A repeat load in the same conversation returns the same content
+        behind an "already loaded" note, so the agent can tell a recovery
+        re-read from progress.
+
         :param arguments: JSON with ``"name"`` key, e.g.
             ``'{"name": "code-review"}'``.
-        :param ctx: Server-side execution context (unused by
-            skill tools, required by the :class:`Tool` interface).
+        :param ctx: Server-side execution context. ``conversation_id``
+            scopes the already-loaded set; when it is ``None`` every load
+            reads as a first load.
         :returns: The skill content string, or an error
             message if the skill is not found.
         """
@@ -138,7 +155,15 @@ class LoadSkillTool(Tool):
             available = list(self._skills_by_name.keys())
             return f"Error: skill {skill_name!r} not found. Available skills: {available}"
         resources = list_skill_resources(skill)
-        return format_skill_content(skill, resources)
+        content = format_skill_content(skill, resources)
+        conversation_id = ctx.conversation_id
+        if conversation_id is None:
+            return content
+        loaded = self._loaded_by_conversation.setdefault(conversation_id, set())
+        if skill_name in loaded:
+            return f"{_ALREADY_LOADED}\n\n{content}"
+        loaded.add(skill_name)
+        return content
 
 
 def list_skill_resources(skill: SkillSpec) -> list[str]:
