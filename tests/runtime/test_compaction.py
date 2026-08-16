@@ -22,6 +22,7 @@ from omnigent.runtime.compaction import (
     _BINARY_CONTENT_CLEARED,
     _TOOL_RESULT_CLEARED,
     _clear_binary_content,
+    _clear_tool_results,
     _is_summary_auth_error,
     _pair_aware_drop_count,
     _truncate_oldest,
@@ -366,6 +367,106 @@ async def test_layer1_clears_tool_results_outside_window(monkeypatch: pytest.Mon
     )
     # summary_metadata=None confirms only Layer 1 fired (Layer 2 not triggered).
     assert result.summary_metadata is None
+
+
+@pytest.mark.asyncio
+async def test_layer1_keeps_loaded_skill_instructions(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    A ``load_skill`` output survives Layer 1 while an ordinary tool result
+    beside it is cleared.
+
+    A skill exists only as this output in the transcript, so clearing it makes
+    the agent re-call ``load_skill`` to recover its own instructions — and the
+    repeated-call guard latches on that second identical call and ends the
+    turn. Same window arithmetic as the clearing test above: boundary=9, so
+    indices 0..8 are eligible.
+    """
+    monkeypatch.setattr("omnigent.runtime.compaction.count_tokens", lambda msgs, model: 50)
+
+    history = [
+        _user_msg("msg_u1", "iter1"),
+        _fc_item("msg_fc1", "c1"),
+        _fco_item("msg_fco1", "c1"),
+        _assistant_msg("msg_a1"),
+        _user_msg("msg_u2", "iter2"),
+        _fc_item("msg_fc2", "c2"),
+        _fco_item("msg_fco2", "c2"),
+        _assistant_msg("msg_a2"),
+        _user_msg("msg_u3", "iter3"),
+        _fc_item("msg_fc3", "c3"),
+        _fco_item("msg_fco3", "c3"),
+        _assistant_msg("msg_a3"),
+    ]
+    messages = [
+        _user_msg_dict("iter1"),
+        _fc_dict("c1", name="load_skill"),
+        _fco_dict("c1", "Review the code carefully."),
+        _assistant_msg_dict(),
+        _user_msg_dict("iter2"),
+        _fc_dict("c2"),
+        _fco_dict("c2", "tool result iter2"),
+        _assistant_msg_dict(),
+        _user_msg_dict("iter3"),
+        _fc_dict("c3"),
+        _fco_dict("c3", "tool result iter3"),
+        _assistant_msg_dict(),
+    ]
+
+    result = await compact(
+        messages,
+        history,
+        config=CompactionConfig(trigger_threshold=0.8, recent_window=2),
+        context_window=100000,
+        system_token_budget=0,
+        model="openai/gpt-4o",
+        task_id="task_skill",
+        llm_client=_RaisesIfCalled(),
+    )
+
+    assert result.messages[2]["output"] == "Review the code carefully.", (
+        "The load_skill output is outside the recent window but must survive "
+        f"Layer 1; got: {result.messages[2]['output']!r}"
+    )
+    assert result.messages[6]["output"] == _TOOL_RESULT_CLEARED, (
+        "An ordinary tool result beside it must still be cleared; got: "
+        f"{result.messages[6]['output']!r}"
+    )
+
+
+def test_summarization_input_still_clears_skill_output() -> None:
+    """
+    The Layer 2 summarization input clears durable outputs like any other.
+
+    That copy is read once by the summarizer, which is about to condense it —
+    paying full token price to carry the skill text in verbatim is the cost
+    this exemption must not leak into.
+    """
+    messages = [
+        _fc_dict("c1", name="load_skill"),
+        _fco_dict("c1", "Review the code carefully."),
+    ]
+
+    _clear_tool_results(messages, len(messages), keep_durable=False)
+
+    assert messages[1]["output"] == _TOOL_RESULT_CLEARED
+
+
+def test_durable_exemption_needs_the_matching_call() -> None:
+    """
+    An output is kept only when its own ``function_call`` names a durable
+    tool — a stray call id must not shelter an unrelated result.
+    """
+    messages = [
+        _fc_dict("c1", name="load_skill"),
+        _fco_dict("c1", "skill body"),
+        _fc_dict("c2", name="sys_os_read"),
+        _fco_dict("c2", "file body"),
+    ]
+
+    _clear_tool_results(messages, len(messages))
+
+    assert messages[1]["output"] == "skill body"
+    assert messages[3]["output"] == _TOOL_RESULT_CLEARED
 
 
 @pytest.mark.asyncio

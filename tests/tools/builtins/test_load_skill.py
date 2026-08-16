@@ -131,6 +131,75 @@ def test_load_skill_rejects_non_string_name(
     assert result == "Error: 'name' must be a string"
 
 
+@pytest.fixture()
+def conversation_ctx() -> ToolContext:
+    """
+    A :class:`ToolContext` carrying a conversation id.
+
+    The shared ``tool_ctx`` fixture leaves ``conversation_id`` unset, which is
+    the "every load is a first load" path.
+
+    :returns: A context scoped to ``"conv_alice"``.
+    """
+    return ToolContext(
+        task_id="task_test",
+        agent_id="agent_test",
+        conversation_id="conv_alice",
+    )
+
+
+def test_repeat_load_returns_the_content_behind_a_note(
+    skill_no_resources: SkillSpec,
+    conversation_ctx: ToolContext,
+) -> None:
+    """
+    A second load of the same skill repeats the instructions, prefixed.
+
+    Withholding them would be worse than the loop it prevents: a skill lives
+    only as this tool's output in the transcript, so once compaction drops
+    that output the second call is the only way back to the instructions.
+    """
+    tool = LoadSkillTool([skill_no_resources])
+    args = json.dumps({"name": "summarize"})
+
+    first = tool.invoke(args, conversation_ctx)
+    second = tool.invoke(args, conversation_ctx)
+
+    assert not first.startswith("[Already loaded")
+    assert second.startswith("[Already loaded")
+    assert skill_no_resources.content in second, (
+        f"the repeat load must still carry the instructions; got: {second!r}"
+    )
+
+
+def test_already_loaded_is_scoped_per_conversation(
+    skill_no_resources: SkillSpec,
+) -> None:
+    """One conversation's load must not mark the skill loaded in another."""
+    tool = LoadSkillTool([skill_no_resources])
+    args = json.dumps({"name": "summarize"})
+    alice = ToolContext(task_id="t", agent_id="a", conversation_id="conv_alice")
+    bob = ToolContext(task_id="t", agent_id="a", conversation_id="conv_bob")
+
+    tool.invoke(args, alice)
+
+    assert not tool.invoke(args, bob).startswith("[Already loaded")
+    assert tool.invoke(args, alice).startswith("[Already loaded")
+
+
+def test_a_failed_load_is_not_recorded(
+    skill_no_resources: SkillSpec,
+    conversation_ctx: ToolContext,
+) -> None:
+    """An unknown skill name must not mark anything as loaded."""
+    tool = LoadSkillTool([skill_no_resources])
+
+    tool.invoke(json.dumps({"name": "nonexistent"}), conversation_ctx)
+    result = tool.invoke(json.dumps({"name": "summarize"}), conversation_ctx)
+
+    assert not result.startswith("[Already loaded")
+
+
 def test_load_skill_schema_lists_skill_names(
     skill_no_resources: SkillSpec,
     skill_with_resources: SkillSpec,
