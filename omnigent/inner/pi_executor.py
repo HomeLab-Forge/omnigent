@@ -2108,7 +2108,14 @@ def _latest_user_directive(messages: Sequence[Message]) -> str:
     return "Continue the current user request."
 
 
-def _git_output(cwd: str, *args: str) -> str | None:
+def _git_output(cwd: str, *args: str, strip: bool = True) -> str | None:
+    """Run git in *cwd* and return stdout, or ``None`` when it fails.
+
+    :param strip: Trim surrounding whitespace. Pass ``False`` for
+        ``--porcelain -z``, whose first record opens with the index status —
+        a space for a worktree-only change — that stripping would eat along
+        with the path's own leading blank.
+    """
     try:
         result = subprocess.run(
             ["git", "-C", cwd, *args],
@@ -2121,7 +2128,7 @@ def _git_output(cwd: str, *args: str) -> str | None:
         return None
     if result.returncode != 0:
         return None
-    return result.stdout.strip()
+    return result.stdout.strip() if strip else result.stdout
 
 
 def _repository_name(remote: str | None) -> str | None:
@@ -2131,11 +2138,58 @@ def _repository_name(remote: str | None) -> str | None:
     return match.group(1) if match else None
 
 
+#: How far below a non-repository workspace to look for the checkout being
+#: worked on, and how many directories to examine getting there. A sandbox is
+#: laid out ``<workspace>/<org>/<repo>``, so two levels reaches the repo.
+_WORKSPACE_SCAN_DEPTH = 2
+_WORKSPACE_SCAN_LIMIT = 64
+
+
+def _dirty_repository_under(workspace: str) -> str | None:
+    """Return the checkout below *workspace* that has uncommitted work.
+
+    A workspace holding several checkouts is not itself a repository, so
+    ``rev-parse`` at its root reports nothing and a handover taken there
+    carries no file list — the agent is told its own edits do not exist. The
+    repository with changes is the one it was working in.
+
+    Picks the first dirty checkout in sorted order. The handover model holds
+    one repository, so an agent that edited two loses the second here.
+
+    :param workspace: Directory holding one or more checkouts.
+    :returns: Worktree root of the first dirty checkout, or ``None``.
+    """
+    examined = 0
+    frontier = [(pathlib.Path(workspace), 0)]
+    while frontier:
+        current, depth = frontier.pop(0)
+        if depth >= _WORKSPACE_SCAN_DEPTH or examined >= _WORKSPACE_SCAN_LIMIT:
+            continue
+        try:
+            children = sorted(p for p in current.iterdir() if p.is_dir())
+        except OSError:
+            continue
+        for child in children:
+            examined += 1
+            if examined > _WORKSPACE_SCAN_LIMIT:
+                break
+            if child.name.startswith("."):
+                continue
+            if (child / ".git").exists():
+                if _git_output(str(child), "status", "--porcelain=v1"):
+                    return _git_output(str(child), "rev-parse", "--show-toplevel") or str(child)
+                continue
+            frontier.append((child, depth + 1))
+    return None
+
+
 def _capture_repository_state(cwd: str | None) -> RepositoryState | None:
     """Read bounded Git state without changing the worktree."""
     if not cwd:
         return None
     root = _git_output(cwd, "rev-parse", "--show-toplevel")
+    if not root:
+        root = _dirty_repository_under(cwd)
     if not root:
         return RepositoryState(workspace=cwd)
 
@@ -2143,7 +2197,7 @@ def _capture_repository_state(cwd: str | None) -> RepositoryState | None:
     head = _git_output(root, "rev-parse", "HEAD") or None
     upstream_head = _git_output(root, "rev-parse", "@{upstream}") or None
     remote = _git_output(root, "remote", "get-url", "origin")
-    status = _git_output(root, "status", "--porcelain=v1", "-z") or ""
+    status = _git_output(root, "status", "--porcelain=v1", "-z", strip=False) or ""
 
     staged: list[str] = []
     modified: list[str] = []
