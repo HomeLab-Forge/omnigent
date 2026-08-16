@@ -502,6 +502,18 @@ _GUARD_DO_NEXT = (
     "list what is blocking you, and ask the user one question."
 )
 
+#: Said on a correction rather than a stop. The repeat is evidence the call
+#: itself is wrong, not that the task is finished — a guard that only ever ends
+#: the turn makes the human the recovery mechanism.
+_GUARD_DO_DIFFERENTLY = (
+    "do_next: this exact call will keep failing. Do not repeat it and do not "
+    "vary its spelling. Read the last error, then either reach the same fact a "
+    "different way or state what is blocking you."
+)
+#: Corrections issued this turn, so the second detection can stop instead of
+#: correcting again.
+_LOOP_CORRECTION_KEY = "_policy_loop_corrections"
+
 
 def _latched_reason(state: object, *, armed_only: bool = True) -> str:
     """Read the latched guard reason.
@@ -606,6 +618,7 @@ def detect_loop(
     ignore_arg_keys: list[str] | None = None,
     normalize_uri_args: bool = False,
     latch: bool = False,
+    corrections_before_latch: int = 0,
 ) -> PolicyCallable:
     """Factory: detect repeated tool calls against the same target.
 
@@ -645,6 +658,13 @@ def detect_loop(
     :param latch: Once this guard or ``detect_thrashing`` trips, deny every
         remaining tool call in the turn with the same instruction, instead of
         denying one result and letting the agent try the next variant.
+    :param corrections_before_latch: How many detections are answered with a
+        correction — deny this call, say why, and clear the window so a
+        different approach is not flagged by the stale hashes — before the
+        latch closes. ``0`` latches on the first detection. Above ``0`` the
+        agent gets that many chances to route around a wrong call on its own,
+        which is the difference between a guard that recovers a turn and one
+        that only ends it.
     :returns: A policy callable that detects repeated calls on one target.
     """
     window = max(1, window)
@@ -665,6 +685,11 @@ def detect_loop(
                 "result": "ALLOW",
                 "state_updates": [
                     {"key": _LOOP_STATE_KEY, "action": "set", "value": []},
+                    *(
+                        [{"key": _LOOP_CORRECTION_KEY, "action": "set", "value": 0}]
+                        if corrections_before_latch > 0
+                        else []
+                    ),
                     *(_latch_release() if latch else []),
                 ],
             }
@@ -715,17 +740,33 @@ def detect_loop(
             repeated = (
                 "the same target" if (ignore_keys or normalize_uri_args) else "identical arguments"
             )
+            corrections = state.get(_LOOP_CORRECTION_KEY)
+            issued = corrections if isinstance(corrections, int) else 0
+            correcting = issued < corrections_before_latch
             reason = (
                 f"Loop guard: tool '{tool_name}' was called with {repeated} "
                 f"{count} times in the last {len(recent)} calls. Rephrasing the "
-                f"arguments will not change the result. {_GUARD_DO_NEXT}"
+                "arguments will not change the result. "
+                f"{_GUARD_DO_DIFFERENTLY if correcting else _GUARD_DO_NEXT}"
             )
             return {
                 "result": normalized_action,
                 "reason": reason,
                 "state_updates": [
-                    {"key": _LOOP_STATE_KEY, "action": "set", "value": recent},
-                    *([_latch_update(reason)] if latch else []),
+                    # A correction clears the window: the next call should be a
+                    # different approach, and the hashes behind this trip would
+                    # otherwise flag it on arrival.
+                    {
+                        "key": _LOOP_STATE_KEY,
+                        "action": "set",
+                        "value": [] if correcting else recent,
+                    },
+                    *(
+                        [{"key": _LOOP_CORRECTION_KEY, "action": "set", "value": issued + 1}]
+                        if corrections_before_latch > 0
+                        else []
+                    ),
+                    *([_latch_update(reason)] if latch and not correcting else []),
                 ],
             }
 
