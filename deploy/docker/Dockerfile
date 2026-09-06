@@ -272,15 +272,29 @@ COPY --from=pi-builder /opt/pi-release/node /opt/pi
 # (the binary/package map `omnigent setup` installs from) — keep the
 # two in sync. A signed HomeLab build installs the packaged Pi fork from
 # /opt/pi. Other builds retain the upstream npm fallback.
+# Qwen Code and OpenCode are here to be TRIED, not because anything uses them
+# yet. The watchdog runs a local Qwen model through ollama-proxy, and pi keeps
+# printing tool invocations as text instead of calling them - the failure the
+# pi_executor fork patches work around. Both are built for local
+# OpenAI-compatible endpoints, so the cheap experiment is to point a scratch
+# agent at one and see whether that workaround is needed at all.
+#
+# Version floors come from omnigent's own _HARNESS_INSTALL table (qwen 0.18.1,
+# opencode 1.17.7 with an exclusive 1.19.0 ceiling); staying inside that range
+# keeps the image reproducible and the harness spec honest.
 RUN npm install -g --no-audit --no-fund \
       @anthropic-ai/claude-code \
       @openai/codex \
+      @qwen-code/qwen-code@^0.18.1 \
+      opencode-ai@~1.18.0 \
  && if [ -x /opt/pi/pi ]; then \
       ln -sf /opt/pi/pi /usr/local/bin/pi; \
     else \
       npm install -g --no-audit --no-fund @earendil-works/pi-coding-agent; \
     fi \
  && pi --version \
+ && qwen --version \
+ && opencode --version \
  && npm cache clean --force
 
 # Kiro CLI is not published as an npm package, and its installer has NO version
