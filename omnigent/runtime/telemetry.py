@@ -130,6 +130,36 @@ _REDACT_KEY_SUBSTRINGS = (
     "api_key",
     "apikey",
 )
+_SECRET_VALUE_RE = r'(?:"[^"]*"|\'[^\']*\'|[^\s&,;]+)'
+_SECRET_ASSIGNMENT_RE = re.compile(
+    rf"(?i)\b(?P<key>{'|'.join(_REDACT_KEY_SUBSTRINGS)})\s*=\s*(?P<value>{_SECRET_VALUE_RE})"
+)
+_SECRET_QUERY_RE = re.compile(
+    rf"(?i)(?P<prefix>[?&](?:{'|'.join(_REDACT_KEY_SUBSTRINGS)})=)(?P<value>[^&#\s]+)"
+)
+_URL_USERINFO_RE = re.compile(r"(?i)(https?://)[^/@\s]+@")
+_BEARER_RE = re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]+")
+
+
+def redact_and_cap_text(value: Any, max_length: int = _CONTENT_MAX_LEN) -> str:
+    """
+    Redact secret-bearing text and cap the retained string.
+
+    Used by the session checkpoint, which persists agent-authored text: a
+    checkpoint is written to the conversation store and read back on resume,
+    so anything a turn echoed into it would otherwise outlive the turn.
+
+    :param value: Text (or any value, stringified) to redact.
+    :param max_length: Cap for the retained string.
+    :returns: Redacted text, truncated with a marker when over the cap.
+    """
+    text = value if isinstance(value, str) else str(value)
+    text = _SECRET_ASSIGNMENT_RE.sub(r"\g<key>=[redacted]", text)
+    text = _SECRET_QUERY_RE.sub(r"\g<prefix>[redacted]", text)
+    text = _URL_USERINFO_RE.sub(r"[redacted]@", text)
+    text = _BEARER_RE.sub("Bearer [redacted]", text)
+    suffix = "…[truncated]"
+    return text if len(text) <= max_length else text[: max_length - len(suffix)] + suffix
 
 
 def _redact_payload(payload: Mapping[str, Any]) -> dict[str, Any]:

@@ -160,9 +160,19 @@ from omnigent.runner.subagent_routing import (
 )
 from omnigent.runtime.harnesses.process_manager import HarnessProcessManager, NoLiveHarnessError
 from omnigent.runtime.prompt import (
+    append_framework_instructions,
     build_instructions,
     build_instructions_nullable,
     raw_author_instructions,
+)
+from omnigent.runtime.session_checkpoint import (
+    SessionCheckpoint,
+    SessionHandover,
+    build_checkpoint,
+    checkpoint_instruction,
+    handover_instruction,
+    latest_user_directive,
+    prune_covered_history,
 )
 from omnigent.server.schemas import (
     BackgroundSessionTitleRequest,
@@ -197,6 +207,25 @@ _CLAUDE_MODEL_CONFIRM_POLL_S = 0.25
 # cheap (one tmux capture per poll) and never types blind.
 _CLAUDE_MODEL_LATE_DIALOG_BUDGET_S = 1200.0
 _CLAUDE_MODEL_LATE_DIALOG_POLL_S = 2.0
+
+
+@dataclasses.dataclass(frozen=True)
+class _CheckpointToolCall:
+    operation: Literal["load", "save", "handover_load", "handover_save"]
+    outcome: str
+    latency_ms: float
+    checkpoint: SessionCheckpoint | None
+    input_value: Mapping[str, Any]
+    output_value: Mapping[str, Any] | None = None
+    error_type: str | None = None
+    error_message: str | None = None
+
+
+@dataclasses.dataclass
+class _CheckpointTraceState:
+    turn_epoch: int
+    parent_traceparent: str | None = None
+    pending: list[_CheckpointToolCall] = dataclasses.field(default_factory=list)
 
 
 def _warn_unresolved_sub_agent(session_id: str | None, sub_agent_name: str) -> None:
@@ -2499,6 +2528,314 @@ def create_runner_app(
     app.state.session_event_queues = _session_event_queues
     _session_inboxes = _session_inboxes_ref
     _session_async_tasks: dict[str, dict[str, tuple[asyncio.Task[str], asyncio.Event]]] = {}
+    _checkpoint_enabled_sessions: set[str] = set()
+    _checkpoint_turn_status: dict[str, Literal["idle", "failed", "cancelled"]] = {}
+    _checkpoint_trace_states: dict[str, _CheckpointTraceState] = {}
+    _session_checkpoints: dict[str, SessionCheckpoint] = {}
+    _session_handovers: dict[str, SessionHandover] = {}
+    app.state.checkpoint_turn_status = _checkpoint_turn_status
+
+    def _checkpoint_epoch(session_id: str) -> int:
+        return _turn_bind_epoch.get(session_id, 0)
+
+    def _emit_checkpoint_tool_call(
+        session_id: str,
+        state: _CheckpointTraceState,
+        call: _CheckpointToolCall,
+    ) -> None:
+        parent_traceparent = state.parent_traceparent
+        if parent_traceparent is None:
+            return
+        checkpoint = call.checkpoint
+        is_handover = call.operation.startswith("handover_")
+        operation = call.operation.removeprefix("handover_")
+        telemetry.record_completed_tool_call(
+            f"{'session_handover' if is_handover else 'session_checkpoint'}.{operation}",
+            parent_traceparent=parent_traceparent,
+            attributes={
+                "session.id": session_id,
+                "checkpoint.operation": operation,
+                "checkpoint.outcome": call.outcome,
+                "checkpoint.latency_ms": call.latency_ms,
+                "checkpoint.status": checkpoint.status if checkpoint is not None else "absent",
+                "checkpoint.phase": checkpoint.phase if checkpoint is not None else "absent",
+                "checkpoint.covered_item_count": (
+                    len(checkpoint.covered_items) if checkpoint is not None else 0
+                ),
+                "handover.present": bool(checkpoint and checkpoint.handover),
+                "handover.count": checkpoint.handover_count if checkpoint is not None else 0,
+            },
+            input_value=call.input_value,
+            output_value=call.output_value,
+            error_type=call.error_type,
+            error_message=call.error_message,
+        )
+
+    def _record_checkpoint_tool_call(
+        session_id: str,
+        turn_epoch: int,
+        call: _CheckpointToolCall,
+    ) -> None:
+        state = _checkpoint_trace_states.get(session_id)
+        if state is None or state.turn_epoch != turn_epoch:
+            return
+        if state.parent_traceparent is None:
+            state.pending.append(call)
+            return
+        _emit_checkpoint_tool_call(session_id, state, call)
+
+    def _begin_checkpoint_trace(session_id: str) -> int:
+        turn_epoch = _checkpoint_epoch(session_id)
+        if telemetry.telemetry_enabled():
+            _checkpoint_trace_states[session_id] = _CheckpointTraceState(turn_epoch=turn_epoch)
+        else:
+            _checkpoint_trace_states.pop(session_id, None)
+        return turn_epoch
+
+    def _bind_checkpoint_traceparent(session_id: str, traceparent: str) -> None:
+        normalized = telemetry.normalize_traceparent(traceparent)
+        state = _checkpoint_trace_states.get(session_id)
+        if (
+            normalized is None
+            or state is None
+            or state.turn_epoch != _checkpoint_epoch(session_id)
+        ):
+            return
+        state.parent_traceparent = normalized
+        pending = state.pending
+        state.pending = []
+        for call in pending:
+            _emit_checkpoint_tool_call(session_id, state, call)
+
+    async def _read_session_checkpoint(
+        session_id: str,
+        turn_epoch: int,
+    ) -> SessionCheckpoint | None:
+        started = time.perf_counter()
+        checkpoint: SessionCheckpoint | None = None
+        outcome = "error"
+        output_value: Mapping[str, Any] | None = None
+        error_type: str | None = None
+        error_message: str | None = None
+        try:
+            response = await server_client.get(
+                f"/v1/sessions/{session_id}/checkpoint",
+                timeout=2.0,
+            )
+            if response.status_code == 404:
+                outcome = "absent"
+                output_value = {
+                    "session_id": session_id,
+                    "checkpoint": None,
+                    "status_code": 404,
+                }
+            elif response.status_code != 200:
+                _logger.warning(
+                    "Checkpoint read returned %s for session=%s",
+                    response.status_code,
+                    session_id,
+                )
+                error_type = "HTTPStatusError"
+                error_message = f"Checkpoint read returned HTTP {response.status_code}"
+                output_value = {
+                    "session_id": session_id,
+                    "status_code": response.status_code,
+                }
+            else:
+                payload = response.json().get("checkpoint")
+                checkpoint = (
+                    SessionCheckpoint.model_validate(payload) if payload is not None else None
+                )
+                outcome = "success" if checkpoint is not None else "absent"
+                output_value = {
+                    "session_id": session_id,
+                    "checkpoint": (
+                        checkpoint.model_dump(mode="json") if checkpoint is not None else None
+                    ),
+                    "status_code": response.status_code,
+                }
+        except (httpx.HTTPError, asyncio.TimeoutError, TypeError, ValueError) as exc:
+            error_type = type(exc).__name__
+            error_message = str(exc)
+            _logger.warning("Checkpoint read failed for session=%s", session_id, exc_info=True)
+        finally:
+            _record_checkpoint_tool_call(
+                session_id,
+                turn_epoch,
+                _CheckpointToolCall(
+                    operation="load",
+                    outcome=outcome,
+                    latency_ms=(time.perf_counter() - started) * 1000,
+                    checkpoint=checkpoint,
+                    input_value={"session_id": session_id},
+                    output_value=output_value,
+                    error_type=error_type,
+                    error_message=error_message,
+                ),
+            )
+        return checkpoint
+
+    async def _write_session_checkpoint(
+        checkpoint: SessionCheckpoint,
+        turn_epoch: int,
+    ) -> None:
+        started = time.perf_counter()
+        outcome = "error"
+        output_value: Mapping[str, Any] | None = None
+        error_type: str | None = None
+        error_message: str | None = None
+        try:
+            response = await server_client.put(
+                f"/v1/sessions/{checkpoint.session_id}/checkpoint",
+                json={"checkpoint": checkpoint.model_dump(mode="json")},
+                timeout=2.0,
+            )
+            if response.status_code != 200:
+                _logger.warning(
+                    "Checkpoint write returned %s for session=%s",
+                    response.status_code,
+                    checkpoint.session_id,
+                )
+                error_type = "HTTPStatusError"
+                error_message = f"Checkpoint write returned HTTP {response.status_code}"
+            else:
+                outcome = "success"
+            output_value = {
+                "session_id": checkpoint.session_id,
+                "status_code": response.status_code,
+            }
+        except (httpx.HTTPError, asyncio.TimeoutError) as exc:
+            error_type = type(exc).__name__
+            error_message = str(exc)
+            _logger.warning(
+                "Checkpoint write failed for session=%s",
+                checkpoint.session_id,
+                exc_info=True,
+            )
+        finally:
+            _record_checkpoint_tool_call(
+                checkpoint.session_id,
+                turn_epoch,
+                _CheckpointToolCall(
+                    operation="save",
+                    outcome=outcome,
+                    latency_ms=(time.perf_counter() - started) * 1000,
+                    checkpoint=checkpoint,
+                    input_value={
+                        "session_id": checkpoint.session_id,
+                        "checkpoint": checkpoint.model_dump(mode="json"),
+                    },
+                    output_value=output_value,
+                    error_type=error_type,
+                    error_message=error_message,
+                ),
+            )
+
+    async def _checkpoint_for_turn(
+        session_id: str,
+        harness_name: str | None,
+        history: list[_JsonObject],
+    ) -> tuple[SessionCheckpoint | None, list[_JsonObject]]:
+        if is_native_harness(harness_name):
+            return None, history
+        _checkpoint_enabled_sessions.add(session_id)
+        turn_epoch = _begin_checkpoint_trace(session_id)
+        checkpoint = await _read_session_checkpoint(session_id, turn_epoch)
+        if checkpoint is None:
+            _session_checkpoints.pop(session_id, None)
+            _session_handovers.pop(session_id, None)
+            return None, history
+        checkpoint = checkpoint.model_copy(
+            update={
+                "latest_user_directive": latest_user_directive(history),
+                "status": "active",
+                "updated_at": datetime.now(UTC).isoformat(),
+            }
+        )
+        _session_checkpoints[session_id] = checkpoint
+        if checkpoint.handover is not None:
+            _session_handovers[session_id] = checkpoint.handover
+            _record_checkpoint_tool_call(
+                session_id,
+                turn_epoch,
+                _CheckpointToolCall(
+                    operation="handover_load",
+                    outcome="success",
+                    latency_ms=0.0,
+                    checkpoint=checkpoint,
+                    input_value={"session_id": session_id},
+                    output_value={
+                        "session_id": session_id,
+                        "handover": checkpoint.handover.model_dump(mode="json"),
+                    },
+                ),
+            )
+        else:
+            _session_handovers.pop(session_id, None)
+        await _write_session_checkpoint(checkpoint, turn_epoch)
+        return checkpoint, cast(list[_JsonObject], prune_covered_history(checkpoint, history))
+
+    async def _persist_session_checkpoint(
+        session_id: str,
+        turn_epoch: int | None = None,
+    ) -> None:
+        if session_id not in _checkpoint_enabled_sessions:
+            return
+        state = _checkpoint_trace_states.get(session_id)
+        resolved_epoch = (
+            turn_epoch
+            if turn_epoch is not None
+            else state.turn_epoch
+            if state is not None
+            else _checkpoint_epoch(session_id)
+        )
+        status = _checkpoint_turn_status.pop(session_id, None)
+        if status is None:
+            return
+        try:
+            active_checkpoint = _session_checkpoints.get(session_id)
+            handover = _session_handovers.get(session_id)
+            checkpoint = build_checkpoint(
+                session_id=session_id,
+                history=_session_histories.get(session_id, []),
+                status=status,
+                handover=handover,
+                handover_count=(
+                    active_checkpoint.handover_count
+                    if active_checkpoint is not None
+                    else int(handover is not None)
+                ),
+            )
+            if checkpoint.status == "complete":
+                checkpoint = checkpoint.model_copy(update={"handover": None})
+                _session_handovers.pop(session_id, None)
+            _session_checkpoints[session_id] = checkpoint
+            await _write_session_checkpoint(checkpoint, resolved_epoch)
+        except (TypeError, ValueError):
+            _logger.warning(
+                "Checkpoint persistence failed for session=%s",
+                session_id,
+                exc_info=True,
+            )
+        finally:
+            state = _checkpoint_trace_states.get(session_id)
+            if state is not None and state.turn_epoch == resolved_epoch:
+                _checkpoint_trace_states.pop(session_id, None)
+
+    def _schedule_checkpoint_persist(session_id: str) -> None:
+        state = _checkpoint_trace_states.get(session_id)
+        turn_epoch = state.turn_epoch if state is not None else _checkpoint_epoch(session_id)
+        task = asyncio.create_task(
+            _persist_session_checkpoint(session_id, turn_epoch),
+            name=f"checkpoint-{session_id}",
+        )
+        _background_tasks.add(task)
+        task.add_done_callback(_background_tasks.discard)
+
+    app.state.checkpoint_for_turn = _checkpoint_for_turn
+    app.state.persist_session_checkpoint = _persist_session_checkpoint
+    app.state.bind_checkpoint_traceparent = _bind_checkpoint_traceparent
+    app.state.session_histories = _session_histories
 
     def _has_active_work() -> bool:
         if _active_turns:
@@ -3951,6 +4288,10 @@ def create_runner_app(
         if _binding := _session_comment_relays.pop(session_id, None):
             _binding.relay.close()
         _session_histories.pop(session_id, None)
+        _checkpoint_enabled_sessions.discard(session_id)
+        _checkpoint_turn_status.pop(session_id, None)
+        _session_checkpoints.pop(session_id, None)
+        _session_handovers.pop(session_id, None)
         _last_server_item_id.pop(session_id, None)
         _session_event_queues.pop(session_id, None)
         _session_inboxes.pop(session_id, None)
@@ -4290,6 +4631,51 @@ def create_runner_app(
                     ],
                 },
             ]
+
+        if handover is None:
+            return
+
+        _session_handovers[conv] = handover
+        prior_checkpoint = _session_checkpoints.get(conv)
+        checkpoint = build_checkpoint(
+            session_id=conv,
+            history=_session_histories.get(conv, []),
+            status="active",
+            handover=handover,
+            handover_count=(prior_checkpoint.handover_count if prior_checkpoint else 0) + 1,
+        )
+        _session_checkpoints[conv] = checkpoint
+        state = _checkpoint_trace_states.get(conv)
+        turn_epoch = state.turn_epoch if state is not None else _checkpoint_epoch(conv)
+        await _write_session_checkpoint(checkpoint, turn_epoch)
+        handover_payload = handover.model_dump(mode="json")
+        _record_checkpoint_tool_call(
+            conv,
+            turn_epoch,
+            _CheckpointToolCall(
+                operation="handover_save",
+                outcome="success",
+                latency_ms=0.0,
+                checkpoint=checkpoint,
+                input_value={"session_id": conv, "handover": handover_payload},
+                output_value={"session_id": conv, "saved": True},
+            ),
+        )
+        if event.get("handover_loaded") is True:
+            _record_checkpoint_tool_call(
+                conv,
+                turn_epoch,
+                _CheckpointToolCall(
+                    operation="handover_load",
+                    outcome="success",
+                    latency_ms=0.0,
+                    checkpoint=checkpoint,
+                    input_value={"session_id": conv},
+                    output_value={"session_id": conv, "handover": handover_payload},
+                ),
+            )
+
+    app.state.handle_harness_compaction = _handle_harness_compaction
 
     _CANCELLATION_TOOL_OUTPUT = "[Cancelled — tool execution was interrupted.]"
     _CANCELLATION_MARKER_TEXT = (
@@ -6499,6 +6885,7 @@ def create_runner_app(
             # error event) is never shadowed by the generic except below.
             raise
         except asyncio.CancelledError as exc:
+            _checkpoint_turn_status[conv] = "cancelled"
             _logger.error(
                 "turn cancelled for %s: %s",
                 conv,
@@ -6509,6 +6896,7 @@ def create_runner_app(
             _on_proxy_stream_end(conv, error={"message": f"turn setup failed: {exc}"})
             raise
         except Exception as exc:
+            _checkpoint_turn_status[conv] = "failed"
             _logger.error(
                 "turn setup failed for %s: %s",
                 conv,
@@ -6518,6 +6906,7 @@ def create_runner_app(
             )
             _on_proxy_stream_end(conv, error={"message": f"turn setup failed: {exc}"})
         finally:
+            _schedule_checkpoint_persist(conv)
             # Permanent-wedge floor: guarantee _active_turns is never left stale,
             # however the body exits — including a BaseException that escapes
             # ``except Exception``. A setup-phase abnormal exit otherwise leaves
@@ -6650,6 +7039,13 @@ def create_runner_app(
                 [] if is_native_harness(harness_name) else await _load_history_as_input(conv)
             )
         _raw_per_request_instructions = cast(str | None, msg_body.get("instructions"))
+        _checkpoint, checkpoint_history = await _checkpoint_for_turn(
+            conv,
+            harness_name,
+            _session_histories[conv],
+        )
+        if conv in _checkpoint_enabled_sessions:
+            _checkpoint_turn_status[conv] = "idle"
         if cached_spec is not None:
             spawn_env = _build_spawn_env_from_spec(
                 cached_spec,
@@ -6754,6 +7150,9 @@ def create_runner_app(
                 )
         if _session_histories[conv]:
             harness_body["content"] = _session_histories[conv]
+        if checkpoint_history:
+            history = checkpoint_history
+            harness_body["content"] = history
         else:
             harness_body["content"] = msg_body.get(
                 "content",
@@ -6929,6 +7328,7 @@ def create_runner_app(
         if isinstance(response, StreamingResponse):
             await _drain_streaming_response(response, conv)
         else:
+            _checkpoint_turn_status[conv] = "failed"
             err_detail = "harness returned error response"
             if hasattr(response, "body"):
                 with contextlib.suppress(
@@ -7196,6 +7596,7 @@ def create_runner_app(
                 get_arguments,
                 get_call_id,
                 get_tool_name,
+                get_traceparent,
                 is_action_required,
                 should_dispatch_locally,
             )
@@ -7359,6 +7760,11 @@ def create_runner_app(
                                     raise _ContextWindowOverflow(*_overflow)
 
                                 _evt_type = event.get("type")
+                                if _evt_type == "trace_context.available":
+                                    traceparent = event.get("traceparent")
+                                    if isinstance(traceparent, str):
+                                        _bind_checkpoint_traceparent(conv_id, traceparent)
+                                    continue
                                 if _evt_type == "injection.consumed":
                                     _inj_id = event.get("injection_id")
                                     _buf = _session_message_buffers.get(conv_id)
@@ -7400,6 +7806,7 @@ def create_runner_app(
                                         )
                                         _text_acc.clear()
                                 elif _evt_type == "response.failed":
+                                    _checkpoint_turn_status[conv_id] = "failed"
                                     _err = event.get("error") or (event.get("response") or {}).get(
                                         "error"
                                     )
@@ -7543,6 +7950,7 @@ def create_runner_app(
                                                     ),
                                                     publish_event=_publish_event,
                                                     filesystem_registry=filesystem_registry,
+                                                    traceparent=get_traceparent(event),
                                                 )
                                             )
                                         )
@@ -7665,11 +8073,13 @@ def create_runner_app(
                     if _dispatch_tasks:
                         await _asyncio.gather(*_dispatch_tasks, return_exceptions=True)
 
+                    await _persist_session_checkpoint(conv_id)
                     _on_proxy_stream_end(
                         conv_id, error=_stream_failed_error, owner_response_id=_response_id
                     )
 
             except _ContextWindowOverflow as overflow:
+                _checkpoint_turn_status[conv_id] = "failed"
                 _error = {
                     "code": "context_length_exceeded",
                     "message": (
@@ -7688,6 +8098,7 @@ def create_runner_app(
                 yield _response_failed_event(_error)
 
             except (httpx.HTTPError, RuntimeError) as exc:
+                _checkpoint_turn_status[conv_id] = "failed"
                 _logger.exception(
                     "proxy stream connection error for %s: %s",
                     conv_id,
@@ -7870,12 +8281,55 @@ def create_runner_app(
                 _publish_turn_status(conversation_id, "running")
 
                 if stream:
+                    checkpoint, checkpoint_history = await _checkpoint_for_turn(
+                        conversation_id,
+                        cast(str | None, message_body.get("harness")),
+                        _session_histories[conversation_id],
+                    )
+                    if conversation_id in _checkpoint_enabled_sessions:
+                        _checkpoint_turn_status[conversation_id] = "idle"
+                    if checkpoint is not None:
+                        message_body["content"] = checkpoint_history
+                        message_body["instructions"] = append_framework_instructions(
+                            cast(str | None, message_body.get("instructions")),
+                            tuple(
+                                instruction
+                                for instruction in (
+                                    checkpoint_instruction(checkpoint),
+                                    (
+                                        handover_instruction(checkpoint.handover)
+                                        if checkpoint.handover is not None
+                                        else None
+                                    ),
+                                )
+                                if instruction is not None
+                            ),
+                        )
                     response = await _stream_message_to_harness(message_body, conversation_id)
-                    if not isinstance(response, StreamingResponse):
+                    if isinstance(response, StreamingResponse):
+                        source = response.body_iterator
+
+                        async def _checkpointed_stream() -> AsyncIterator[bytes]:
+                            try:
+                                async for chunk in source:
+                                    yield chunk
+                            except asyncio.CancelledError:
+                                _checkpoint_turn_status[conversation_id] = "cancelled"
+                                raise
+                            except Exception:
+                                _checkpoint_turn_status[conversation_id] = "failed"
+                                raise
+                            finally:
+                                _schedule_checkpoint_persist(conversation_id)
+
+                        response.body_iterator = _checkpointed_stream()
+                    else:
+                        _checkpoint_turn_status[conversation_id] = "failed"
                         _on_proxy_stream_end(
                             conversation_id,
                             error={"message": "harness returned error response"},
                         )
+                        _schedule_checkpoint_persist(conversation_id)
                     return response
 
                 _turn_task = asyncio.create_task(
@@ -10158,6 +10612,15 @@ def create_runner_app(
             arguments = cast(_JsonObject, params.get("arguments") or {})
             input_responses = cast(_JsonObject | None, params.get("inputResponses"))
             request_state = cast(str | None, params.get("requestState"))
+            from omnigent.runtime.telemetry import normalize_traceparent
+
+            raw_meta = params.get("_meta")
+            request_traceparent = normalize_traceparent(
+                raw_meta.get("traceparent") if isinstance(raw_meta, dict) else None
+            )
+            request_meta = (
+                {"traceparent": request_traceparent} if request_traceparent is not None else None
+            )
             if not tool_name:
                 return JSONResponse(
                     status_code=200,
@@ -10215,6 +10678,7 @@ def create_runner_app(
                             tool_name,
                             arguments,
                             session_id=session_id,
+                            traceparent=request_traceparent,
                         )
                 except McpElicitationRequired as elicit:
                     return JSONResponse(

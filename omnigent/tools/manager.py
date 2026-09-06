@@ -159,6 +159,12 @@ class ToolManager:
         self._register_sub_agent_tools()
         self._register_session_tools()
         self._register_agent_mgmt_tools()
+        # NOTE: the auto-registered groups below run unconditionally and are
+        # pruned afterwards by ``_drop_declined_framework_tools``, rather than
+        # each carrying its own gate. Registration order matters here — several
+        # of these passes are idempotent-with-precedence and one reads what an
+        # earlier one registered — so pruning once at the end keeps the gate in
+        # a single readable place and cannot reorder anything.
         self._register_os_env_tools()
         self._register_terminal_tools()
         self._register_local_tools(workdir)
@@ -196,6 +202,38 @@ class ToolManager:
         # can drive the desktop app's browser without the spec opting in
         # (framework-owned).
         self._register_browser_tools()
+        self._drop_declined_framework_tools()
+
+    def _drop_declined_framework_tools(self) -> None:
+        """
+        Remove the framework tool groups the spec declined.
+
+        Gated on :attr:`AgentSpec.framework_tools`, which defaults to
+        ``"all"`` — so a spec that says nothing keeps every tool it has
+        today and this is a no-op. Only names in
+        :data:`omnigent.spec.parser.FRAMEWORK_TOOL_GROUPS` are eligible;
+        anything a spec opted into explicitly (MCP servers, local tools,
+        os_env, terminals) and anything the framework promises
+        unconditionally (``sys_cancel_task``) is out of scope by
+        construction, because it is not in that map.
+
+        Declining is not the same as denying. A guardrail that rejects a
+        tool call still costs the model the turn it spent choosing the
+        tool; not advertising it costs nothing.
+        """
+        from omnigent.spec.parser import FRAMEWORK_TOOL_GROUPS
+
+        selected = self._spec.framework_tools
+        if selected == "all":
+            return
+        keep: set[str] = set()
+        if isinstance(selected, list):
+            for group in selected:
+                keep.update(FRAMEWORK_TOOL_GROUPS.get(group, ()))
+        for names in FRAMEWORK_TOOL_GROUPS.values():
+            for name in names:
+                if name not in keep:
+                    self._tools.pop(name, None)
 
     def _register_policy_tools(self) -> None:
         """

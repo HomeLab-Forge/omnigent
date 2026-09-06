@@ -6,6 +6,7 @@ import logging
 import os
 import re
 import sys
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Literal, TypedDict, cast
 
@@ -91,7 +92,7 @@ _YAML_1_2_BOOL_RE = re.compile(r"^(?:true|True|TRUE|false|False|FALSE)$")
 
 # ``executor.config`` keys kept as their nested YAML structure instead of
 # string-coerced — their consumers read the nested mapping/list shape.
-_STRUCTURED_EXECUTOR_CONFIG_KEYS: frozenset[str] = frozenset()
+_STRUCTURED_EXECUTOR_CONFIG_KEYS: frozenset[str] = frozenset({"smart_compaction"})
 
 # Copy the resolver dict onto the subclass before mutating — it's inherited
 # from SafeLoader by reference, so in-place edits below would strip
@@ -278,6 +279,12 @@ def parse(root: Path, *, expand_env: bool = True) -> AgentSpec:
     # granting named users; ``public`` also allows ``__public__``
     # anonymous read.
     agent_session_sharing = _parse_share_policy(raw.get("agent_session_sharing"))
+    # Top-level ``framework_tools:`` selects which of the auto-registered
+    # framework tool GROUPS are advertised. Defaults to "all", so every
+    # existing spec keeps today's surface. See
+    # :func:`_parse_framework_tools` for why this exists and why it is
+    # groups rather than tool names.
+    framework_tools = _parse_framework_tools(raw.get("framework_tools"))
 
     # Honor ``prompt:`` as the legacy alias for ``instructions:`` (per
     # ``_OMNIGENT_SYSTEM_PROMPT_KEYS``); ``instructions:`` wins if both set.
@@ -315,7 +322,35 @@ def parse(root: Path, *, expand_env: bool = True) -> AgentSpec:
         timers=timers,
         spawn=spawn,
         agent_session_sharing=agent_session_sharing,
+        framework_tools=framework_tools,
     )
+
+
+def _window_from_compaction_trigger(config: Mapping[str, object]) -> int | None:
+    """Derive the effective context window from a smart-compaction trigger.
+
+    An agent that rolls its context over at ``trigger_tokens`` never reaches
+    the model's physical window, so that trigger IS its effective window: it
+    is what the display ring should divide by and what compaction should
+    budget against. Stating both means writing one boundary down twice, and
+    a spec whose two numbers disagree is a bug nothing detects.
+
+    Only fills the gap. An explicit ``executor.context_window`` still wins,
+    for the case where an author means the physical window deliberately.
+
+    :param config: The parsed ``executor.config`` mapping.
+    :returns: The trigger as a positive int, or ``None`` when smart
+        compaction is absent, disabled, or carries no usable trigger.
+    """
+    compaction = config.get("smart_compaction")
+    if not isinstance(compaction, Mapping):
+        return None
+    if not compaction.get("enabled", False):
+        return None
+    trigger = compaction.get("trigger_tokens")
+    if isinstance(trigger, bool) or not isinstance(trigger, int) or trigger <= 0:
+        return None
+    return trigger
 
 
 def _parse_llm(
@@ -666,6 +701,8 @@ def _parse_executor(
     context_window: int | None = (
         _parse_int_field(raw_cw, "executor.context_window") if raw_cw is not None else None
     )
+    if context_window is None:
+        context_window = _window_from_compaction_trigger(config)
     raw_model = raw.get("model")
     model: str | None = str(raw_model) if raw_model is not None else None
     raw_effort = raw.get("reasoning_effort")
@@ -2198,6 +2235,106 @@ def _parse_skills_filter(raw: object) -> str | list[str]:
     raise OmnigentError(
         f'top-level skills: must be "all", "none", or a list of skill '
         f"names; got {type(raw).__name__}",
+        code=ErrorCode.INVALID_INPUT,
+    )
+
+
+#: The auto-registered framework tool groups an agent may decline, and the
+#: tools each one advertises. Groups rather than tool names on purpose: a spec
+#: says which CAPABILITY it wants, so adding a tool to a group later reaches
+#: the agents that asked for that capability and nobody else. A name list would
+#: silently grow the surface of every spec that did not know to exclude it.
+#:
+#: Not listed and therefore never declinable: ``sys_cancel_task`` (every
+#: dispatched handle's system message names it, so the promise only holds if it
+#: is always in the schema), the OS-env, terminal, skill and MCP tools (already
+#: spec-gated), and the async/timer/spawn builtins (already gated by ``async:``,
+#: ``timers:`` and ``spawn:``).
+FRAMEWORK_TOOL_GROUPS: dict[str, tuple[str, ...]] = {
+    "browser": (
+        "browser_navigate",
+        "browser_snapshot",
+        "browser_click",
+        "browser_type",
+        "browser_screenshot",
+    ),
+    "comments": ("list_comments", "update_comment"),
+    "policy": ("sys_add_policy", "sys_policy_registry"),
+    "scheduled_tasks": (
+        "sys_scheduled_task_create",
+        "sys_scheduled_task_list",
+        "sys_scheduled_task_update",
+        "sys_scheduled_task_delete",
+    ),
+    "agent_mgmt": ("sys_agent_get", "sys_agent_download", "sys_agent_list"),
+    "session": (
+        "sys_session_list",
+        "sys_session_get_history",
+        "sys_session_get_info",
+        "sys_session_rename",
+    ),
+}
+
+
+def _parse_framework_tools(raw: object) -> str | list[str]:
+    """
+    Parse the top-level YAML ``framework_tools:`` field into a group filter.
+
+    Every group in :data:`FRAMEWORK_TOOL_GROUPS` registers unconditionally
+    today, which is right for a desktop agent and wrong for a headless one.
+    A server-driven ops agent is handed five ``browser_*`` tools it cannot
+    reach and two review-comment tools that can only return empty, and then
+    has to reason about them on every turn. Declaring the surface is cheaper
+    than writing a guardrail to deny each tool after the model has already
+    picked it.
+
+    Supported YAML shapes, mirroring the top-level ``skills:`` field:
+
+    - field omitted / ``null`` / ``"all"`` → ``"all"``; every group
+      registers. Default, so no existing spec changes behaviour.
+    - ``"none"`` or ``[]`` → ``"none"``; no declinable group registers.
+    - ``[<group>, ...]`` → only the named groups register.
+
+    :param raw: The raw YAML value (already parsed). One of ``None``, a
+        string, or a list.
+    :returns: ``"all"``, ``"none"``, or a non-empty ``list[str]``.
+    :raises OmnigentError: When the value isn't one of the supported
+        shapes, or a name is not a known group. An unknown group is an
+        error rather than a no-op: silently ignoring a typo would hand the
+        agent a surface it explicitly declined.
+    """
+    known = ", ".join(sorted(FRAMEWORK_TOOL_GROUPS))
+    if raw is None:
+        return "all"
+    if isinstance(raw, str):
+        if raw not in ("all", "none"):
+            raise OmnigentError(
+                f'top-level framework_tools: must be "all", "none", or a list '
+                f"of group names ({known}); got string {raw!r}",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        return raw
+    if isinstance(raw, list):
+        if len(raw) == 0:
+            return "none"
+        names: list[str] = []
+        for item in raw:
+            if not isinstance(item, str):
+                raise OmnigentError(
+                    f"top-level framework_tools: list items must be strings; "
+                    f"got {type(item).__name__} {item!r}",
+                    code=ErrorCode.INVALID_INPUT,
+                )
+            if item not in FRAMEWORK_TOOL_GROUPS:
+                raise OmnigentError(
+                    f"top-level framework_tools: unknown group {item!r}; known groups are {known}",
+                    code=ErrorCode.INVALID_INPUT,
+                )
+            names.append(item)
+        return names
+    raise OmnigentError(
+        f'top-level framework_tools: must be "all", "none", or a list of '
+        f"group names ({known}); got {type(raw).__name__}",
         code=ErrorCode.INVALID_INPUT,
     )
 

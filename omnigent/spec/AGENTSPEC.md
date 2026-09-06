@@ -66,10 +66,46 @@ tools:
   agents:                     # sub-agents this agent is allowed to call
     - researcher              # the sub-agent's declared name (see agents/)
 
+framework_tools: all          # which auto-registered tool groups to advertise:
+                              #   all (default) | none | [<group>, ...]
+                              # groups: agent_mgmt, browser, comments, policy,
+                              #   scheduled_tasks, session
+
 params:                       # arbitrary key-value; readable by skills and tools
   max_results: 10             # not interpreted by the runtime
   prefer_recent: true
 ```
+
+### `framework_tools`
+
+Some tools register on every agent whether or not the spec asks for them. That
+suits a desktop agent and not a headless one: an agent running under a server
+harness is handed five `browser_*` tools it has no browser for, and
+`list_comments` / `update_comment`, which can only return empty when no user is
+attached to review anything. It then reasons about all of them on every turn.
+
+Declining a group is not the same as denying it with a guardrail. A guardrail
+rejects the call after the model has already spent the turn choosing the tool;
+an unadvertised tool costs nothing.
+
+| Group | Tools |
+|---|---|
+| `agent_mgmt` | `sys_agent_get`, `sys_agent_download`, `sys_agent_list` |
+| `browser` | `browser_navigate`, `browser_snapshot`, `browser_click`, `browser_type`, `browser_screenshot` |
+| `comments` | `list_comments`, `update_comment` |
+| `policy` | `sys_add_policy`, `sys_policy_registry` |
+| `scheduled_tasks` | `sys_scheduled_task_create`, `sys_scheduled_task_list`, `sys_scheduled_task_update`, `sys_scheduled_task_delete` |
+| `session` | `sys_session_list`, `sys_session_get_history`, `sys_session_get_info`, `sys_session_rename` |
+
+The value takes the same shapes as `skills:` — `all` (default), `none`, an
+explicit list, or `[]` which reads as `none`. Groups rather than tool names, so
+a tool added to a group later reaches the agents that asked for that capability
+and nobody else. An unknown group name is an error, not a no-op.
+
+`sys_cancel_task` is not declinable: every dispatched handle's system message
+names it, so it has to stay in the schema. Everything else outside the table is
+already gated somewhere else — `async:`, `timers:`, `spawn:`, `os_env:`,
+`terminals:`, and the MCP and local-tool blocks.
 
 ### `interaction` axes
 

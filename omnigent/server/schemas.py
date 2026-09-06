@@ -25,6 +25,7 @@ from pydantic import (
     model_validator,
 )
 
+from omnigent.runtime.session_checkpoint import SessionCheckpoint
 from omnigent.entities import (
     DEFAULT_GENERATED_TITLE_MAX_CHARS,
     USER_SESSION_TITLE_MAX_CHARS,
@@ -1735,6 +1736,21 @@ class SessionLabelsResponse(BaseModel):
 
     id: str
     labels: dict[str, str] = Field(default_factory=dict)
+
+
+class SessionCheckpointReplaceRequest(BaseModel):
+    """Replace only the framework checkpoint stored for a session."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    checkpoint: SessionCheckpoint | None = None
+
+
+class SessionCheckpointResponse(BaseModel):
+    """Framework checkpoint response without unrelated session state."""
+
+    session_id: str
+    checkpoint: SessionCheckpoint | None = None
 
 
 # Stages of a managed-sandbox launch, in pipeline order: the sandbox
