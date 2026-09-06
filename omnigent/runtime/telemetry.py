@@ -118,6 +118,18 @@ def telemetry_enabled() -> bool:
 # large; the trace backend is not a payload store, so cap aggressively.
 _CONTENT_MAX_LEN = 4096
 
+_TRACEPARENT_RE = re.compile(
+    r"^00-(?P<trace_id>[0-9a-f]{32})-(?P<span_id>[0-9a-f]{16})-(?P<flags>[0-9a-f]{2})$"
+)
+
+
+def normalize_traceparent(value: object) -> str | None:
+    """Return a canonical W3C traceparent, or ``None`` when invalid."""
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip().lower()
+    return normalized if _TRACEPARENT_RE.fullmatch(normalized) else None
+
 # Substrings that mark a payload key as a secret to redact even when content
 # capture is on — a frame body like ``host.launch_runner`` carries a
 # ``binding_token``, and we never want a credential on a span.

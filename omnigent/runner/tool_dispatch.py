@@ -908,6 +908,13 @@ def get_arguments(event: _JsonObject) -> str:
     return arguments if isinstance(arguments, str) else "{}"
 
 
+def get_traceparent(event: _JsonObject) -> str | None:
+    """Extract a validated W3C traceparent from an action_required event."""
+    from omnigent.runtime.telemetry import normalize_traceparent
+
+    return normalize_traceparent(_event_item(event).get("traceparent"))
+
+
 def should_dispatch_locally(tool_name: str) -> bool:
     """Return True if this tool should be dispatched by the runner locally.
 
