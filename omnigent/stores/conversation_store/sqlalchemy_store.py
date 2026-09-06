@@ -1353,7 +1353,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         deliberately uses ``_session`` rather than the conversation session.
         The row lock makes each JSON read/merge/write a single transaction.
         """
-        with self._session() as session:
+        with self._session("set_session_state_key") as session:
             metadata = session.scalar(
                 select(SqlConversationMetadata)
                 .where(
