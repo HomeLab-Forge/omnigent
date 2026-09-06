@@ -16,6 +16,11 @@ import logging
 import re
 from typing import Literal
 
+from omnigent.policies.builtins.safety import (
+    _GUARD_DO_NEXT,
+    _latch_release,
+    _latch_update,
+)
 from omnigent.policies.schema import (
     PolicyCallable,
     PolicyEvent,
@@ -302,6 +307,13 @@ def detect_task_switch(
 
 _THRASHING_HISTORY_KEY = "_thrashing_results"
 
+# Outcomes of the round-trip in flight, before they are folded into the history
+# above. A model emits several tool calls from one response, so counting each
+# result separately treats one decision as many: five calls that all fail read
+# as five consecutive failures when the agent only chose once. Session d24accf4
+# tripped the five-error threshold that way, on a batch it could not revise.
+_THRASHING_BATCH_KEY = "_thrashing_batch"
+
 _ERROR_PREFIXES: tuple[str, ...] = (
     "error:",
     "error -",
@@ -339,6 +351,24 @@ def _looks_like_error(result: str) -> bool:
     lower = result[:500].lower().lstrip()
     if any(lower.startswith(p) for p in _ERROR_PREFIXES):
         return True
+    try:
+        payload = json.loads(result)
+    except (TypeError, ValueError):
+        payload = None
+    if isinstance(payload, dict):
+        exit_code = payload.get("exit_code")
+        if (
+            payload.get("isError") is True
+            or payload.get("is_error") is True
+            or payload.get("success") is False
+            or payload.get("error") not in (None, False, "", {}, [])
+            or (isinstance(exit_code, int | float) and exit_code != 0)
+            or str(payload.get("status", "")).lower()
+            in {"error", "failed", "failure", "cancelled"}
+            or str(payload.get("outcome", "")).lower()
+            in {"error", "failed", "failure", "cancelled"}
+        ):
+            return True
     if _ERROR_JSON_RE.match(result[:500]):
         return True
     return False
@@ -350,6 +380,9 @@ def detect_thrashing(
     window: int = 10,
     window_error_rate: float = 0.8,
     action: str = "ASK",
+    reset_on_request: bool = True,
+    latch: bool = False,
+    collapse_batches: bool = False,
 ) -> PolicyCallable:
     """Factory: detect when an agent is failing repeatedly.
 
@@ -381,6 +414,15 @@ def detect_thrashing(
         the rate check.  Defaults to ``0.8`` (80%).
     :param action: Response when thrashing is detected — ``"ASK"``
         (default) or ``"DENY"``.
+    :param reset_on_request: Clear result history for each user turn.
+    :param latch: Close the shared guard latch on detection, so
+        ``detect_loop`` denies every remaining tool call in the turn.
+        This policy fires on ``tool_result`` and never sees a
+        ``tool_call``, so it can only set the latch — enabling it here
+        without also enabling ``detect_loop`` writes a flag nothing
+        reads. Set it when the denial alone is not ending the turn:
+        observed in session f5d06617, where the agent took the
+        five-consecutive-errors denial and made sixteen more calls.
     :returns: A policy callable that fires on ``tool_result`` events.
     """
     normalised_action = _normalise_action(action, policy_name="detect_thrashing")
@@ -398,7 +440,46 @@ def detect_thrashing(
             (abstain) for non-``tool_result`` events; ALLOW with
             updated state otherwise.
         """
-        if event.get("type") != "tool_result":
+        effective_window = max(window, 1)
+        keep = max(effective_window, consecutive_threshold)
+
+        def _history(state: object) -> list[int]:
+            raw = state.get(_THRASHING_HISTORY_KEY) if isinstance(state, dict) else None
+            if isinstance(raw, list) and all(isinstance(value, int) for value in raw):
+                return raw
+            return []
+
+        event_type = event.get("type")
+        if event_type == "request" and reset_on_request:
+            return {
+                "result": "ALLOW",
+                "state_updates": [
+                    {"key": _THRASHING_HISTORY_KEY, "action": "set", "value": []},
+                    {"key": _THRASHING_BATCH_KEY, "action": "set", "value": None},
+                    *(_latch_release() if latch else []),
+                ],
+            }
+
+        # The model is about to be called again, so it has seen every result
+        # from the batch just executed. Fold that batch into one outcome.
+        if collapse_batches and event_type == "llm_request":
+            state = event.get("session_state") or {}
+            batch = state.get(_THRASHING_BATCH_KEY)
+            if not isinstance(batch, int):
+                return None
+            return {
+                "result": "ALLOW",
+                "state_updates": [
+                    {
+                        "key": _THRASHING_HISTORY_KEY,
+                        "action": "set",
+                        "value": [*_history(state), batch][-keep:],
+                    },
+                    {"key": _THRASHING_BATCH_KEY, "action": "set", "value": None},
+                ],
+            }
+
+        if event_type != "tool_result":
             return None
 
         data = event.get("data")
@@ -411,39 +492,42 @@ def detect_thrashing(
         is_error = 1 if _looks_like_error(result_str) else 0
 
         state = event.get("session_state") or {}
-        raw_history = state.get(_THRASHING_HISTORY_KEY)
-        if isinstance(raw_history, list) and all(isinstance(v, int) for v in raw_history):
-            history: list[int] = raw_history
+        history = _history(state)
+
+        if collapse_batches:
+            # The batch counts as failed once any call in it fails, and stays
+            # provisional until the next round-trip flushes it. Checking
+            # against the provisional value keeps the guard able to fire
+            # inside a long batch without counting that batch more than once.
+            open_batch = state.get(_THRASHING_BATCH_KEY)
+            batch = max(open_batch if isinstance(open_batch, int) else 0, is_error)
+            updated = [*history, batch][-keep:]
+            carried: list[dict[str, object]] = [
+                {"key": _THRASHING_BATCH_KEY, "action": "set", "value": batch}
+            ]
         else:
-            history = []
+            updated = [*history, is_error][-keep:]
+            carried = [{"key": _THRASHING_HISTORY_KEY, "action": "set", "value": updated}]
 
-        effective_window = max(window, 1)
-        keep = max(effective_window, consecutive_threshold)
-        updated = [*history, is_error][-keep:]
-
-        state_update: PolicyResponse = {
-            "result": "ALLOW",
-            "state_updates": [
-                {
-                    "key": _THRASHING_HISTORY_KEY,
-                    "action": "set",
-                    "value": updated,
-                }
-            ],
-        }
+        state_update: PolicyResponse = {"result": "ALLOW", "state_updates": carried}
 
         # ── Consecutive check ──────────────────────────────────────
         if consecutive_threshold > 0 and len(updated) >= consecutive_threshold:
             tail = updated[-consecutive_threshold:]
             if all(v == 1 for v in tail):
+                # No count, no threshold — see the note above _GUARD_STOP_PREFIX
+                # in policies/builtins/safety.py.
+                reason = (
+                    "Loop guard: the agent's tool calls are failing one after "
+                    f"another. {_GUARD_DO_NEXT}"
+                )
                 return {
                     "result": normalised_action,
-                    "reason": (
-                        f"The agent has hit {consecutive_threshold} consecutive "
-                        f"tool errors. It may be stuck — review and redirect, "
-                        f"or start a fresh session."
-                    ),
-                    "state_updates": state_update["state_updates"],
+                    "reason": reason,
+                    "state_updates": [
+                        *state_update["state_updates"],
+                        *([_latch_update(reason)] if latch else []),
+                    ],
                 }
 
         # ── Window rate check ──────────────────────────────────────
@@ -451,15 +535,17 @@ def detect_thrashing(
             rate_window = updated[-effective_window:]
             rate = sum(rate_window) / len(rate_window)
             if rate >= window_error_rate:
-                pct = int(rate * 100)
+                reason = (
+                    "Loop guard: the agent's recent tool calls have been "
+                    f"failing repeatedly. {_GUARD_DO_NEXT}"
+                )
                 return {
                     "result": normalised_action,
-                    "reason": (
-                        f"The agent has a {pct}% error rate over the last "
-                        f"{effective_window} tool calls. It may be stuck — "
-                        f"review and redirect, or start a fresh session."
-                    ),
-                    "state_updates": state_update["state_updates"],
+                    "reason": reason,
+                    "state_updates": [
+                        *state_update["state_updates"],
+                        *([_latch_update(reason)] if latch else []),
+                    ],
                 }
 
         return state_update
@@ -576,6 +662,33 @@ POLICY_REGISTRY: list[dict[str, object]] = [
                         "Response when thrashing is detected. "
                         "ASK escalates to the user (default); "
                         "DENY blocks the next tool result outright."
+                    ),
+                },
+                "reset_on_request": {
+                    "type": "boolean",
+                    "default": True,
+                    "description": "Clear result history for each user turn.",
+                },
+                "latch": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": (
+                        "Close the shared guard latch on detection so "
+                        "detect_loop denies every remaining tool call in the "
+                        "turn. Requires detect_loop with latch enabled; this "
+                        "policy sees no tool_call events and cannot enforce "
+                        "the latch on its own."
+                    ),
+                },
+                "collapse_batches": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": (
+                        "Count all the tool results of one LLM round-trip as a "
+                        "single outcome. A model emits several tool calls from "
+                        "one response, so counting each result separately reads "
+                        "one decision as many. Requires llm_request in the "
+                        "policy's event list."
                     ),
                 },
             },

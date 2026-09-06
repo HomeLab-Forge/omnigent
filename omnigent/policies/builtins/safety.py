@@ -8,10 +8,12 @@ Python. Each callable follows the :class:`PolicyEvent` →
 
 from __future__ import annotations
 
+import fnmatch as _fnmatch
 import hashlib as _hashlib
 import json as _json
 import re as _re
 from typing import Literal
+from urllib.parse import unquote as _unquote
 
 from omnigent.policies.schema import (
     PolicyCallable,
@@ -128,7 +130,337 @@ def max_tool_calls_per_session(limit: int = 100) -> PolicyCallable:
     return evaluate
 
 
+_TURN_TOOL_COUNT_KEY = "_policy_turn_tool_call_count"
+_TURN_TOOL_FAILURE_KEY = "_policy_turn_tool_failure_count"
+
+
+def _state_count(value: object) -> int:
+    try:
+        return int(value) if isinstance(value, int | float | str) else 0
+    except (TypeError, ValueError):
+        return 0
+
+
+def _tool_result_failed(data: object) -> bool:
+    if isinstance(data, dict) and "result" in data:
+        data = data["result"]
+    if isinstance(data, str):
+        try:
+            data = _json.loads(data)
+        except (TypeError, ValueError):
+            return bool(_re.match(r"^\s*(?:error|fatal)\s*:", data, _re.IGNORECASE))
+    if not isinstance(data, dict):
+        return False
+    exit_code = data.get("exit_code")
+    return bool(
+        data.get("isError") is True
+        or data.get("is_error") is True
+        or data.get("success") is False
+        or data.get("error") not in (None, False, "", {}, [])
+        or (isinstance(exit_code, int | float) and exit_code != 0)
+        or str(data.get("status", "")).lower() in {"error", "failed", "failure", "cancelled"}
+        or str(data.get("outcome", "")).lower() in {"error", "failed", "failure", "cancelled"}
+    )
+
+
+def tool_budget_per_turn(
+    max_calls: int = 12,
+    max_failures: int = 2,
+) -> PolicyCallable:
+    """Factory: bound tool calls and consecutive failed results within one turn."""
+    max_calls = max(1, max_calls)
+    max_failures = max(1, max_failures)
+
+    def evaluate(event: PolicyEvent) -> PolicyResponse:
+        event_type = event.get("type")
+        if event_type == "request":
+            return {
+                "result": "ALLOW",
+                "state_updates": [
+                    {"key": _TURN_TOOL_COUNT_KEY, "action": "set", "value": 0},
+                    {"key": _TURN_TOOL_FAILURE_KEY, "action": "set", "value": 0},
+                ],
+            }
+        state = event.get("session_state") or {}
+        calls = _state_count(state.get(_TURN_TOOL_COUNT_KEY, 0))
+        failures = _state_count(state.get(_TURN_TOOL_FAILURE_KEY, 0))
+        if event_type == "tool_call":
+            if failures >= max_failures:
+                return {
+                    "result": "DENY",
+                    "reason": (
+                        f"Stopped after {failures} consecutive failed tool calls "
+                        "in this turn. "
+                        "Read the errors and report the blocker."
+                    ),
+                }
+            if calls >= max_calls:
+                return {
+                    "result": "DENY",
+                    "reason": (
+                        f"Exceeded the {max_calls}-tool budget for this turn. "
+                        "Checkpoint progress and continue in a new turn."
+                    ),
+                }
+            return {
+                "result": "ALLOW",
+                "state_updates": [
+                    {"key": _TURN_TOOL_COUNT_KEY, "action": "increment", "value": 1},
+                ],
+            }
+        if event_type == "tool_result":
+            if _tool_result_failed(event.get("data")):
+                return {
+                    "result": "ALLOW",
+                    "state_updates": [
+                        {"key": _TURN_TOOL_FAILURE_KEY, "action": "increment", "value": 1},
+                    ],
+                }
+            if failures:
+                return {
+                    "result": "ALLOW",
+                    "state_updates": [
+                        {"key": _TURN_TOOL_FAILURE_KEY, "action": "set", "value": 0},
+                    ],
+                }
+        return _ALLOW
+
+    return evaluate
+
+
 _LOOP_STATE_KEY = "_policy_loop_recent_hashes"
+_PROGRESS_STATE_KEY = "_policy_calls_since_progress"
+_EVIDENCE_STATE_KEY = "_policy_evidence_seen"
+
+
+def require_evidence_before_write(
+    paths: list[str] | None = None,
+    evidence_skills: list[str] | None = None,
+    evidence_tools: list[str] | None = None,
+    write_tools: list[str] | None = None,
+    action: Literal["ASK", "DENY"] = "DENY",
+) -> PolicyCallable:
+    """Factory: refuse to author a file the session has no evidence for.
+
+    Some files state a contract the agent cannot derive from the repository:
+    a third-party service's environment variables, an image tag, an upstream
+    API's field names. Reading more of your own code never establishes them,
+    so an agent that only reads locally will write them from memory, fluently
+    and wrongly. Observed: a password-vault service authored with four
+    invented environment variables, a database configured through fields that
+    do not exist, and a comment asserting a setting that was never set.
+
+    The mechanism is deliberately empty of policy. WHICH files carry a
+    contract, and WHAT counts as having checked, are the agent author's
+    judgement and arrive as parameters. This keeps the repository-specific
+    part in the spec, where it can change without a release, and keeps the
+    rule itself short enough that the model meets it once, at the moment it
+    matters, rather than as one more line in a prompt it read ten thousand
+    tokens ago.
+
+    Evidence is session-scoped and never expires: having checked upstream
+    once, the agent may keep writing. The guard exists to prevent authoring
+    blind, not to demand a lookup per file.
+
+    :param paths: Glob patterns, matched against the write's ``path``
+        argument, naming files that state an external contract, e.g.
+        ``["**/compose.yaml", "**/blueprints/*.yaml"]``. Empty disables the
+        policy.
+    :param evidence_skills: Skill names whose loading counts as evidence,
+        e.g. ``["research"]``.
+    :param evidence_tools: Tool names whose use counts as evidence, e.g. a
+        documentation fetch.
+    :param write_tools: Tools treated as authoring. Defaults to
+        ``["sys_os_write", "sys_os_edit"]``.
+    :param action: ``"ASK"`` or ``"DENY"`` when evidence is missing.
+    :returns: A policy callable that gates authorship on evidence.
+    """
+    patterns = tuple(paths or ())
+    skills = frozenset(evidence_skills or ())
+    tools = frozenset(evidence_tools or ())
+    writers = frozenset(write_tools or ["sys_os_write", "sys_os_edit"])
+    normalized_action = action.upper() if action.upper() in {"ASK", "DENY"} else "DENY"
+
+    def _matches(path: str) -> bool:
+        # Match the whole path and the bare name, so a caller may write either
+        # "**/compose.yaml" or "compose.yaml" and mean the same thing.
+        tail = path.rsplit("/", 1)[-1]
+        return any(
+            _fnmatch.fnmatch(path, pattern) or _fnmatch.fnmatch(tail, pattern)
+            for pattern in patterns
+        )
+
+    def evaluate(event: PolicyEvent) -> PolicyResponse:
+        """Evaluate whether this write has the evidence behind it.
+
+        :param event: Policy event dict.
+        :returns: The configured action for an unevidenced write, else ALLOW.
+        """
+        if event.get("type") != "tool_call" or not patterns:
+            return _ALLOW
+        data = event.get("data")
+        if not isinstance(data, dict):
+            return _ALLOW
+
+        tool_name = data.get("name", "")
+        arguments = data.get("arguments")
+        arguments = arguments if isinstance(arguments, dict) else {}
+
+        state = event.get("session_state") or {}
+        raw_seen = state.get(_EVIDENCE_STATE_KEY)
+        seen = (
+            [item for item in raw_seen if isinstance(item, str)]
+            if isinstance(raw_seen, list)
+            else []
+        )
+
+        # Record evidence. load_skill is checked by the skill it names, every
+        # other tool by its own name.
+        found = None
+        if tool_name == "load_skill":
+            skill = arguments.get("name")
+            if isinstance(skill, str) and skill in skills:
+                found = f"skill:{skill}"
+        elif tool_name in tools:
+            found = f"tool:{tool_name}"
+        if found is not None and found not in seen:
+            return {
+                "result": "ALLOW",
+                "state_updates": [
+                    {"key": _EVIDENCE_STATE_KEY, "action": "set", "value": [*seen, found]},
+                ],
+            }
+
+        if tool_name not in writers or seen:
+            return _ALLOW
+        path = arguments.get("path")
+        if not isinstance(path, str) or not _matches(path):
+            return _ALLOW
+
+        wanted = sorted({*(f"the {name} skill" for name in skills), *tools})
+        return {
+            "result": normalized_action,
+            "reason": (
+                f"Evidence guard: {path} states a contract owned by something "
+                "outside this repository — environment variable names, image "
+                "tags, endpoints — and nothing in this session has checked what "
+                "that contract actually is. Reading more of our own code cannot "
+                "establish it. Check the primary source first"
+                + (f" using {' or '.join(wanted)}" if wanted else "")
+                + ", then write. Names copied from memory are the failure this "
+                "guard exists to catch."
+            ),
+        }
+
+    return evaluate
+
+
+def require_progress(
+    budget: int = 25,
+    progress_tools: list[str] | None = None,
+    action: Literal["ASK", "DENY"] = "DENY",
+    exempt_tools: list[str] | None = None,
+    reset_on_request: bool = True,
+) -> PolicyCallable:
+    """Factory: stop an agent that gathers evidence and never acts.
+
+    Counts tool calls since the last one that CHANGED something, and
+    denies further calls once the budget is spent. A call naming any
+    tool in *progress_tools* resets the counter to zero.
+
+    This is a different failure from :func:`detect_loop`, which needs
+    identical arguments to fire. An agent reading a hundred different
+    files makes no repeated call and no progress either: observed at 79
+    calls across 31 reads, 21 shell commands and 17 searches with zero
+    writes, having announced four separate times that it now understood
+    the code and would begin. Nothing in the stack could see that, because
+    every individual call was reasonable and none of them repeated.
+
+    The denial is not a stop. Its reason names the budget, the fact that
+    nothing has changed yet, and the tools that count as progress, so the
+    next decision is to make the smallest real change rather than to
+    gather more. Deny is preferred over ask for exactly that: an ask can
+    be answered with more reading.
+
+    :param budget: Calls allowed since the last progress call before the
+        action fires. Defaults to ``25``. Clamped to a minimum of ``1``.
+    :param progress_tools: Tool names that count as progress and reset
+        the counter, e.g. ``["sys_os_write", "sys_os_edit"]``. A call to
+        one of these is always allowed. Empty means nothing ever resets,
+        which is a misconfiguration, so an empty list disables the policy.
+    :param action: ``"ASK"`` or ``"DENY"`` once the budget is spent.
+    :param exempt_tools: Tool names that neither count against the budget
+        nor reset it, such as a bounded poll.
+    :param reset_on_request: Clear the counter on each user turn, so a
+        fresh instruction starts with a full budget.
+    :returns: A policy callable that forces a phase transition.
+    """
+    budget = max(1, budget)
+    normalized_action = action.upper() if action.upper() in {"ASK", "DENY"} else "DENY"
+    progress = frozenset(progress_tools or [])
+    exempt = frozenset(exempt_tools or [])
+
+    def evaluate(event: PolicyEvent) -> PolicyResponse:
+        """Evaluate whether this call is allowed given the progress budget.
+
+        :param event: Policy event dict.
+        :returns: The configured action once the budget is spent, else ALLOW.
+        """
+        event_type = event.get("type")
+        if event_type == "request" and reset_on_request:
+            return {
+                "result": "ALLOW",
+                "state_updates": [
+                    {"key": _PROGRESS_STATE_KEY, "action": "set", "value": 0},
+                ],
+            }
+        if event_type != "tool_call" or not progress:
+            return _ALLOW
+        data = event.get("data")
+        if not isinstance(data, dict):
+            return _ALLOW
+
+        tool_name = data.get("name", "")
+        if tool_name in exempt:
+            return _ALLOW
+        if tool_name in progress:
+            return {
+                "result": "ALLOW",
+                "state_updates": [
+                    {"key": _PROGRESS_STATE_KEY, "action": "set", "value": 0},
+                ],
+            }
+
+        state = event.get("session_state") or {}
+        raw = state.get(_PROGRESS_STATE_KEY)
+        spent = raw + 1 if isinstance(raw, int) and raw >= 0 else 1
+
+        if spent > budget:
+            return {
+                "result": normalized_action,
+                "reason": (
+                    f"Progress guard: {spent - 1} tool calls since anything last "
+                    f"changed, against a budget of {budget}, and nothing has been "
+                    "written yet. You have enough to start. Make the smallest "
+                    "change that moves the task forward using one of: "
+                    f"{', '.join(sorted(progress))}. An incomplete first change "
+                    "that can be reviewed is worth more than more evidence. If "
+                    "the task genuinely cannot be started, say what is missing "
+                    "in an incomplete-stop handoff instead of reading further."
+                ),
+                "state_updates": [
+                    {"key": _PROGRESS_STATE_KEY, "action": "set", "value": spent},
+                ],
+            }
+
+        return {
+            "result": "ALLOW",
+            "state_updates": [
+                {"key": _PROGRESS_STATE_KEY, "action": "set", "value": spent},
+            ],
+        }
+
+    return evaluate
 
 
 def _args_hash(tool_name: str, arguments: object) -> str:
@@ -142,30 +474,233 @@ def _args_hash(tool_name: str, arguments: object) -> str:
     return _hashlib.sha256(blob.encode()).hexdigest()
 
 
-def detect_loop(window: int = 10, threshold: int = 3) -> PolicyCallable:
-    """Factory: detect repeated identical tool calls.
+# ── Guard latch ──────────────────────────────────────────────────────────────
+#
+# A DENY suppresses one tool result. It does not end the turn, and an agent
+# under pressure reads the denial as a failed call and tries the next variant.
+# Session f5d06617 is the shape: the thrashing guard fired after five
+# consecutive errors with "End this approach and provide an incomplete-stop
+# handoff", and the agent made sixteen more tool calls.
+#
+# The latch closes that. Once a guard trips it, every later tool call in the
+# turn is denied with the same instruction, so continuing costs a round trip
+# and returns nothing. Summarising and asking is then the only move left, and
+# the instruction describes the situation instead of requesting cooperation.
+#
+# ``detect_loop`` is the enforcer because it is the policy that sees
+# ``tool_call``. ``detect_thrashing`` fires on ``tool_result`` and can only set
+# the latch, so latching it without also enabling ``detect_loop`` sets a flag
+# nothing reads.
+#
+# The latch arms one round-trip after it closes. A model emits a whole batch of
+# tool calls from a single response, so the calls after the one that tripped the
+# guard were already committed before any result came back — denying them
+# punishes a decision the model had no chance to revise. Session d24accf4 shows
+# the shape: one assistant message at 12:34:42, then three fetches, the second
+# suppressed and the third denied, none of which it could have reconsidered.
+#
+# ``llm_request`` fires once per round-trip, so it is the point where the model
+# has demonstrably seen everything so far. Arming there means the batch in
+# flight finishes and the next one is refused.
+_GUARD_LATCH_KEY = "_policy_guard_latch"
+_GUARD_LATCH_ARMED_KEY = "_policy_guard_latch_armed"
+
+#: A guard verdict names the behaviour, never the count or the threshold behind
+#: it. Told "2 times in the last 12 calls", a model starts working the budget —
+#: how many it has left, whether a different spelling resets the window —
+#: instead of why the call did not work. The repetition is the signal it needs;
+#: the arithmetic is ours. Applies to every reason built here and in
+#: ``policies/builtins/context.py``.
+#:
+#: Opens a STOP. The executor adapter matches this prefix to end the turn
+#: behind a final handoff (``_is_terminal_tool_guard_reason``), so it belongs
+#: only on a verdict that really is the end of the road.
+_GUARD_STOP_PREFIX = "Loop guard:"
+
+#: Opens a STEER: one call denied, the turn carries on. It must NOT contain the
+#: stop prefix. Both verdicts used to open with "Loop guard:", and the adapter
+#: cannot see a policy's intent — only that string — so every correction ended
+#: the turn it was issued to rescue, and ``corrections_before_latch`` bought
+#: nothing.
+_GUARD_STEER_PREFIX = "Loop steer:"
+
+_GUARD_DO_NEXT = (
+    "do_next: stop calling tools. Summarize what you have established so far, "
+    "list what is blocking you, and ask the user one question."
+)
+
+#: Said on a steer rather than a stop. The repeat is evidence the call itself is
+#: wrong, not that the task is finished — a guard that only ever ends the turn
+#: makes the human the recovery mechanism.
+_GUARD_DO_DIFFERENTLY = (
+    "do_next: the turn is still yours — this denied one call, not the turn. "
+    "This exact call will keep failing and rephrasing its arguments will not "
+    "change that. Name in one line what you were trying to establish, then "
+    "reach that fact another way. If there is no other way, say what is "
+    "blocking you and stop calling tools."
+)
+#: Corrections issued this turn, so the second detection can stop instead of
+#: correcting again.
+_LOOP_CORRECTION_KEY = "_policy_loop_corrections"
+
+
+def _latched_reason(state: object, *, armed_only: bool = True) -> str:
+    """Read the latched guard reason.
+
+    :param state: The event's ``session_state`` mapping.
+    :param armed_only: When true, a latch that has not yet survived a
+        round-trip reads as open, so the batch it tripped on finishes.
+    :returns: The stored reason, or ``""`` when the latch is open.
+    """
+    if not isinstance(state, dict):
+        return ""
+    value = state.get(_GUARD_LATCH_KEY)
+    reason = value if isinstance(value, str) else ""
+    if reason and armed_only and not state.get(_GUARD_LATCH_ARMED_KEY):
+        return ""
+    return reason
+
+
+def _latch_update(reason: str) -> dict[str, object]:
+    """Build the state update that closes the latch, unarmed."""
+    return {"key": _GUARD_LATCH_KEY, "action": "set", "value": reason}
+
+
+def _latch_arm() -> dict[str, object]:
+    """Build the state update that makes a closed latch start denying."""
+    return {"key": _GUARD_LATCH_ARMED_KEY, "action": "set", "value": True}
+
+
+def _latch_release() -> list[dict[str, object]]:
+    """Build the state updates that open the latch on a new user turn."""
+    return [
+        {"key": _GUARD_LATCH_KEY, "action": "set", "value": ""},
+        {"key": _GUARD_LATCH_ARMED_KEY, "action": "set", "value": False},
+    ]
+
+
+_URI_SCHEME_RE = _re.compile(r"^[a-z][a-z0-9+.-]*://")
+
+
+def _normalize_uri(value: str) -> str:
+    """Reduce one target expressed through different ref schemes to one key.
+
+    An agent that does not know a ref grammar guesses at it, and every guess
+    is a distinct argument tuple to a hash keyed on the raw arguments. In
+    session f5d06617 ``hub.docker.com/r/vaultwarden/server`` was fetched as a
+    bare URL twice and as ``web://…`` once, and
+    ``vaultwarden/vaultwarden@main/README.md`` was fetched under ``repo://``
+    three times with the ``source`` argument varied. Nine calls, two targets,
+    no repeat the loop guard could see.
+
+    Percent-decoding runs first so ``web://https%3A%2F%2Fhost`` reaches the
+    same key as ``https://host``, then schemes are stripped repeatedly because
+    a wrapped ref carries two.
+
+    :param value: A raw string argument value.
+    :returns: The target with scheme, escaping, trailing slash, and case
+        removed.
+    """
+    text = _unquote(value.strip())
+    for _ in range(3):
+        stripped = _URI_SCHEME_RE.sub("", text, count=1)
+        if stripped == text:
+            break
+        text = stripped
+    return text.rstrip("/").lower()
+
+
+def _normalized_arguments(
+    arguments: object,
+    *,
+    ignore_keys: frozenset[str],
+    normalize_uris: bool,
+) -> object:
+    """Project a tool-call argument mapping down to its loop-detection key.
+
+    :param arguments: The raw ``arguments`` value from the tool-call event.
+    :param ignore_keys: Argument names dropped before hashing, for fields that
+        select a backend rather than a target (Oracle's ``source``).
+    :param normalize_uris: Whether string values are reduced by
+        :func:`_normalize_uri`.
+    :returns: The mapping to hash, or *arguments* unchanged when neither
+        option is configured or the value is not a mapping.
+    """
+    if not isinstance(arguments, dict) or not (ignore_keys or normalize_uris):
+        return arguments
+    projected: dict[str, object] = {}
+    for key, value in arguments.items():
+        if key in ignore_keys:
+            continue
+        projected[key] = (
+            _normalize_uri(value) if normalize_uris and isinstance(value, str) else value
+        )
+    return projected
+
+
+def detect_loop(
+    window: int = 10,
+    threshold: int = 3,
+    action: Literal["ASK", "DENY"] = "ASK",
+    exempt_tools: list[str] | None = None,
+    reset_on_request: bool = True,
+    ignore_arg_keys: list[str] | None = None,
+    normalize_uri_args: bool = False,
+    latch: bool = False,
+    corrections_before_latch: int = 0,
+) -> PolicyCallable:
+    """Factory: detect repeated tool calls against the same target.
 
     Tracks recent tool-call hashes in ``session_state`` as a
     bounded list of SHA-256 hex digests keyed by
     ``_policy_loop_recent_hashes``.  When the same hash
     appears *threshold* times within the last *window* calls,
-    returns ASK so the user can break the loop.
+    returns the configured action so the loop can end with a handoff.
 
     This catches the #1 token-waste pattern — an agent retrying
-    the exact same failing tool call — which
+    the same failing tool call — which
     ``max_tool_calls_per_session`` cannot detect because it only
     counts total calls.
+
+    By default the hash covers the raw arguments, so a retry counts only
+    when it is byte-identical. *ignore_arg_keys* and *normalize_uri_args*
+    widen it to the call's target, which is what catches an agent guessing
+    at a ref grammar rather than repeating one ref.
 
     :param window: Number of recent calls to consider.
         Defaults to ``10``. Clamped to a minimum of ``1``.
     :param threshold: How many times a call must repeat within
         *window* to trigger. Defaults to ``3``. Clamped to a
         minimum of ``1``.
-    :returns: A policy callable that ASKs when a loop is
-        detected.
+    :param action: ``"ASK"`` or ``"DENY"`` when a loop is detected.
+    :param exempt_tools: Tool names allowed to repeat, such as a bounded
+        async-result poll.
+    :param reset_on_request: Clear loop history for each user turn.
+    :param ignore_arg_keys: Argument names dropped before hashing. Use for
+        fields that pick a backend rather than a target, so varying one does
+        not read as a new call — Oracle's ``source`` is the case this exists
+        for.
+    :param normalize_uri_args: Reduce string arguments to their target before
+        hashing: percent-decode, strip ``scheme://`` prefixes, drop a trailing
+        slash, lowercase. Collapses ``web://https%3A%2F%2Fhost/p``,
+        ``web://https://host/p`` and ``https://host/p`` to one key.
+    :param latch: Once this guard or ``detect_thrashing`` trips, deny every
+        remaining tool call in the turn with the same instruction, instead of
+        denying one result and letting the agent try the next variant.
+    :param corrections_before_latch: How many detections are answered with a
+        correction — deny this call, say why, and clear the window so a
+        different approach is not flagged by the stale hashes — before the
+        latch closes. ``0`` latches on the first detection. Above ``0`` the
+        agent gets that many chances to route around a wrong call on its own,
+        which is the difference between a guard that recovers a turn and one
+        that only ends it.
+    :returns: A policy callable that detects repeated calls on one target.
     """
     window = max(1, window)
     threshold = max(1, threshold)
+    normalized_action = action.upper() if action.upper() in {"ASK", "DENY"} else "ASK"
+    exempt = frozenset(exempt_tools or [])
+    ignore_keys = frozenset(ignore_arg_keys or [])
 
     def evaluate(event: PolicyEvent) -> PolicyResponse:
         """Evaluate whether the current tool call is a repeated loop.
@@ -173,14 +708,48 @@ def detect_loop(window: int = 10, threshold: int = 3) -> PolicyCallable:
         :param event: Policy event dict.
         :returns: ASK if loop detected, ALLOW otherwise.
         """
-        if event.get("type") != "tool_call":
+        event_type = event.get("type")
+        if event_type == "request" and reset_on_request:
+            return {
+                "result": "ALLOW",
+                "state_updates": [
+                    {"key": _LOOP_STATE_KEY, "action": "set", "value": []},
+                    *(
+                        [{"key": _LOOP_CORRECTION_KEY, "action": "set", "value": 0}]
+                        if corrections_before_latch > 0
+                        else []
+                    ),
+                    *(_latch_release() if latch else []),
+                ],
+            }
+        # One round-trip has passed since the guard tripped, so the batch it
+        # tripped on has finished and the model has seen the denial.
+        if latch and event_type == "llm_request":
+            if _latched_reason(event.get("session_state"), armed_only=False):
+                return {"result": "ALLOW", "state_updates": [_latch_arm()]}
+            return _ALLOW
+        if event_type != "tool_call":
             return _ALLOW
         data = event.get("data")
         if not isinstance(data, dict):
             return _ALLOW
 
         tool_name = data.get("name", "")
-        arguments = data.get("arguments", {})
+        if tool_name in exempt:
+            return _ALLOW
+
+        # A guard already tripped this turn. Nothing the agent calls now can
+        # make progress, so say so rather than denying one call at a time.
+        if latch:
+            latched = _latched_reason(event.get("session_state"))
+            if latched:
+                return {"result": normalized_action, "reason": latched}
+
+        arguments = _normalized_arguments(
+            data.get("arguments", {}),
+            ignore_keys=ignore_keys,
+            normalize_uris=normalize_uri_args,
+        )
         h = _args_hash(tool_name, arguments)
 
         state = event.get("session_state") or {}
@@ -197,15 +766,38 @@ def detect_loop(window: int = 10, threshold: int = 3) -> PolicyCallable:
 
         count = recent.count(h)
         if count >= threshold:
+            repeated = (
+                "against the same target"
+                if (ignore_keys or normalize_uri_args)
+                else "with identical arguments"
+            )
+            corrections = state.get(_LOOP_CORRECTION_KEY)
+            issued = corrections if isinstance(corrections, int) else 0
+            correcting = issued < corrections_before_latch
+            reason = (
+                f"{_GUARD_STEER_PREFIX if correcting else _GUARD_STOP_PREFIX} "
+                f"tool '{tool_name}' has already been called {repeated} in this "
+                "turn and it did not advance anything. "
+                f"{_GUARD_DO_DIFFERENTLY if correcting else _GUARD_DO_NEXT}"
+            )
             return {
-                "result": "ASK",
-                "reason": (
-                    f"The agent appears stuck in a retry loop — "
-                    f"tool '{tool_name}' called with identical arguments "
-                    f"{count} times in the last {len(recent)} calls."
-                ),
+                "result": normalized_action,
+                "reason": reason,
                 "state_updates": [
-                    {"key": _LOOP_STATE_KEY, "action": "set", "value": recent},
+                    # A correction clears the window: the next call should be a
+                    # different approach, and the hashes behind this trip would
+                    # otherwise flag it on arrival.
+                    {
+                        "key": _LOOP_STATE_KEY,
+                        "action": "set",
+                        "value": [] if correcting else recent,
+                    },
+                    *(
+                        [{"key": _LOOP_CORRECTION_KEY, "action": "set", "value": issued + 1}]
+                        if corrections_before_latch > 0
+                        else []
+                    ),
+                    *([_latch_update(reason)] if latch and not correcting else []),
                 ],
             }
 
@@ -693,12 +1285,40 @@ POLICY_REGISTRY: list[dict[str, object]] = [
         },
     },
     {
+        "handler": "omnigent.policies.builtins.safety.tool_budget_per_turn",
+        "kind": "factory",
+        "name": "Limit Tool Calls Per Turn",
+        "description": (
+            "Resets on each user request, limits tool calls within the turn, "
+            "and stops further calls after a bounded run of consecutive failures."
+        ),
+        "params_schema": {
+            "type": "object",
+            "properties": {
+                "max_calls": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "Maximum tool calls allowed in one user turn.",
+                    "default": 12,
+                },
+                "max_failures": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "Failed tool results allowed before later calls are denied.",
+                    "default": 2,
+                },
+            },
+        },
+    },
+    {
         "handler": "omnigent.policies.builtins.safety.detect_loop",
         "kind": "factory",
         "name": "Detect Tool Call Retry Loops",
-        "description": "Detects when the agent is stuck retrying the same tool call with "
-        "identical arguments. ASKs for user approval when the same (tool, args) "
-        "repeats N times within a sliding window of recent calls",
+        "description": "Detects when the agent is stuck retrying the same tool call. "
+        "Returns the configured action when the same (tool, args) repeats N times "
+        "within a sliding window of recent calls. Set ignore_arg_keys and "
+        "normalize_uri_args to key on the call's target instead, which catches an "
+        "agent guessing at a ref grammar rather than repeating one ref",
         "params_schema": {
             "type": "object",
             "properties": {
@@ -713,6 +1333,128 @@ POLICY_REGISTRY: list[dict[str, object]] = [
                     "minimum": 1,
                     "description": "Number of identical repeats within the window to trigger",
                     "default": 3,
+                },
+                "action": {
+                    "type": "string",
+                    "enum": ["ASK", "DENY"],
+                    "description": "Response when a repeated-call loop is detected",
+                    "default": "ASK",
+                },
+                "exempt_tools": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Tool names allowed to repeat without loop detection",
+                    "default": [],
+                },
+                "reset_on_request": {
+                    "type": "boolean",
+                    "description": "Clear recent-call history for each user turn",
+                    "default": True,
+                },
+                "ignore_arg_keys": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Argument names dropped before hashing, for fields "
+                    "that pick a backend rather than a target",
+                    "default": [],
+                },
+                "normalize_uri_args": {
+                    "type": "boolean",
+                    "description": "Key string arguments on their target: percent-decode, "
+                    "strip scheme:// prefixes, drop a trailing slash, lowercase",
+                    "default": False,
+                },
+                "latch": {
+                    "type": "boolean",
+                    "description": "Once this guard or the thrashing guard trips, deny "
+                    "every remaining tool call in the turn with the same instruction",
+                    "default": False,
+                },
+            },
+        },
+    },
+    {
+        "handler": "omnigent.policies.builtins.safety.require_evidence_before_write",
+        "kind": "factory",
+        "name": "Require Evidence Before Authoring A Contract",
+        "description": "Denies writing a file that states a contract owned outside the "
+        "repository (third-party env vars, image tags, endpoints) until the session has "
+        "consulted a primary source. Which files and what counts as evidence are the "
+        "agent author's parameters, not policy baked in here",
+        "params_schema": {
+            "type": "object",
+            "properties": {
+                "paths": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Globs naming files that state an external contract",
+                    "default": [],
+                },
+                "evidence_skills": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Skill names whose loading counts as evidence",
+                    "default": [],
+                },
+                "evidence_tools": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Tool names whose use counts as evidence",
+                    "default": [],
+                },
+                "write_tools": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Tools treated as authoring",
+                    "default": ["sys_os_write", "sys_os_edit"],
+                },
+                "action": {
+                    "type": "string",
+                    "enum": ["ASK", "DENY"],
+                    "description": "Response when evidence is missing",
+                    "default": "DENY",
+                },
+            },
+        },
+    },
+    {
+        "handler": "omnigent.policies.builtins.safety.require_progress",
+        "kind": "factory",
+        "name": "Require Progress Before More Evidence",
+        "description": "Denies further tool calls once the agent has spent its budget "
+        "gathering evidence without changing anything. Distinct from the retry-loop "
+        "guard: a hundred different reads repeat no call and still make no progress",
+        "params_schema": {
+            "type": "object",
+            "properties": {
+                "budget": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "Tool calls allowed since anything last changed",
+                    "default": 25,
+                },
+                "progress_tools": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Tool names that count as progress and reset the budget",
+                    "default": [],
+                },
+                "action": {
+                    "type": "string",
+                    "enum": ["ASK", "DENY"],
+                    "description": "Response once the budget is spent",
+                    "default": "DENY",
+                },
+                "exempt_tools": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Tool names that neither spend nor reset the budget",
+                    "default": [],
+                },
+                "reset_on_request": {
+                    "type": "boolean",
+                    "description": "Restore a full budget for each user turn",
+                    "default": True,
                 },
             },
         },
