@@ -604,8 +604,17 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         streaming=True,
         instruction_delivery=_ID.FIRST_USER_PREFIX,
     ),
+    # CLI_SUBPROCESS, unlike goose above and the generic ``acp`` family.
+    # ``QwenExecutor`` spawns ``qwen --acp`` itself and owns a spawn-env
+    # builder, a harness module, an install spec and a provider family — the
+    # same shape as codex, which is CLI_SUBPROCESS with a JSON-RPC elicitation
+    # channel. ACP_SUBPROCESS reads as "a generic ACP agent someone configured",
+    # and consumers treat it that way: the web UI presents every agent whose
+    # harness carries that mode as a harness rather than an agent, renaming it
+    # after the harness. ``elicitation`` stays SSE_PERMISSION because that is
+    # genuinely how its permission requests arrive.
     "qwen": _C(
-        _IM.ACP_SUBPROCESS,
+        _IM.CLI_SUBPROCESS,
         _EL.SSE_PERMISSION,
         _RS.COLD_ONLY,
         _EF.NONE,
@@ -860,6 +869,17 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
         # stays a valid harness for YAML specs (and the credential-free
         # integration mock LLM), but is no longer offered as a UI pick.
         "pi": "Pi",
+        # qwen is fully wired — harness module, spawn-env builder, install
+        # spec, capabilities, an openai provider family — and an agent spec can
+        # declare ``harness: qwen`` today. Without a label here it is not a
+        # picker row, so the composer's harness control cannot represent such
+        # an agent and falls to whatever row sorts first, which is a silent
+        # harness_override onto an unrelated harness at session create. A
+        # harness a spec may declare is a harness the picker has to be able to
+        # show. Community plugins cannot supply this: _validate_community_
+        # contribution counts harness_labels as a harness key, so contributing
+        # one for an existing harness is rejected as an override attempt.
+        "qwen": "Qwen Code",
         **{name: row.label for name, row in ACP_CLI_HARNESSES.items()},
     },
     capabilities=_BUILTIN_CAPABILITIES,

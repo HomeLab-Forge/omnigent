@@ -319,3 +319,29 @@ def test_builtin_native_provider_bridge_id_label_keys_match_constants() -> None:
         else:
             # Bare builders and claude (resolved via a runner helper) carry no key.
             assert provider.bridge_id_label_key is None, provider.key
+
+
+def test_qwen_is_a_picker_row() -> None:
+    """``harness: qwen`` is declarable by a spec, so it must be selectable.
+
+    ``harness_catalog`` skips any harness without a ``harness_labels`` entry.
+    Without a row the UI's harness control cannot represent an agent that
+    declares this harness, and it does not fall back to the agent's own — it
+    falls to whatever row sorts first and sends that as a ``harness_override``
+    at session create, silently running the agent on an unrelated harness.
+    """
+    assert hp.harness_labels()["qwen"] == "Qwen Code"
+    assert any(row["id"] == "qwen" for row in hp.harness_catalog())
+
+
+def test_qwen_is_not_presented_as_a_generic_acp_agent() -> None:
+    """qwen's integration mode keeps it an agent's harness, not an agent.
+
+    Consumers read ``ACP_SUBPROCESS`` as "a generic ACP agent someone
+    configured" and present every agent carrying such a harness *as* a harness,
+    renaming it after the harness. qwen has its own executor, spawn-env builder
+    and provider family, so it is a CLI subprocess like codex.
+    """
+    from omnigent.harness_capabilities import IntegrationMode
+
+    assert hp.harness_capabilities()["qwen"].integration_mode is IntegrationMode.CLI_SUBPROCESS
