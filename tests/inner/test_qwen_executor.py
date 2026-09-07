@@ -1764,7 +1764,10 @@ async def test_fs_read_blocked_by_result_policy() -> None:
         {"jsonrpc": "2.0", "id": 5, "method": "fs/read_text_file", "params": {"path": "a.txt"}}
     )
 
-    assert policy.await_args.args == ("PHASE_TOOL_RESULT", {"result": "secret"})
+    assert policy.await_args.args == (
+        "PHASE_TOOL_RESULT",
+        {"name": "read_text_file", "result": "secret"},
+    )
     assert "error" in sent[0]
     assert executor._fs_events[-1].status is ToolCallStatus.BLOCKED
 
@@ -1796,7 +1799,10 @@ async def test_fs_write_blocked_by_result_policy() -> None:
         }
     )
 
-    assert policy.await_args_list[-1].args == ("PHASE_TOOL_RESULT", {"result": write_result})
+    assert policy.await_args_list[-1].args == (
+        "PHASE_TOOL_RESULT",
+        {"name": "write_text_file", "result": write_result},
+    )
     assert "error" in sent[0]
     assert executor._fs_events[-1].status is ToolCallStatus.BLOCKED
 
@@ -2321,3 +2327,32 @@ async def test_ensure_initialized_image_capability_defaults_false() -> None:
     await executor._ensure_initialized()
     assert executor._initialized is True
     assert executor._image_supported is False
+
+
+@pytest.mark.asyncio
+async def test_result_phase_policy_events_always_carry_a_tool_name() -> None:
+    """The evaluate endpoint rejects a result-phase event with no tool name.
+
+    ``Policy evaluate requires a non-empty tool name in
+    'event.request_data.name' or 'event.target' for 'PHASE_TOOL_RESULT'`` — and
+    this phase fails open, so a nameless event is answered 400 and defaults to
+    ALLOW. Observed live on session c9d9ed81: four rejections, the gate never
+    fired, and nothing above the runner's warning said so.
+    """
+    from omnigent.inner.datamodel import OSEnvSpec
+
+    executor = QwenExecutor(os_env=OSEnvSpec(type="caller_process"))
+    executor._os_environment = _FakeOSEnv(  # type: ignore[assignment]
+        read_result={"content": "hello", "encoding": "utf-8"}
+    )
+    policy = AsyncMock(return_value=MagicMock(action="POLICY_ACTION_ALLOW"))
+    executor._policy_evaluator = policy  # type: ignore[assignment]
+    executor._send = AsyncMock()  # type: ignore[method-assign]
+
+    await executor._respond_to_agent_request(
+        {"jsonrpc": "2.0", "id": 7, "method": "fs/read_text_file", "params": {"path": "a.txt"}}
+    )
+
+    for call in policy.await_args_list:
+        phase, event = call.args
+        assert event.get("name"), "%s event was sent without a tool name" % phase

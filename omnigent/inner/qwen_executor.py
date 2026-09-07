@@ -829,12 +829,22 @@ class QwenExecutor(Executor):
         return getattr(verdict, "action", None) in ("POLICY_ACTION_DENY", "POLICY_ACTION_ASK")
 
     async def _fs_result_policy_denies(self, tool_name: str, result: Any) -> bool:
-        """Result-phase check on delegated fs results before they reach the model."""
+        """Result-phase check on delegated fs results before they reach the model.
+
+        The name has to travel with the result. The evaluate endpoint rejects a
+        result-phase event that carries no tool name — "Policy evaluate requires
+        a non-empty tool name in 'event.request_data.name' or 'event.target' for
+        'PHASE_TOOL_RESULT'" — and this phase fails open, so every check was
+        answered 400 and defaulted to ALLOW. Silently: the 400 is a warning on
+        the runner and the gate simply never fired.
+        """
         policy_eval = getattr(self, "_policy_evaluator", None)
         if policy_eval is None:
             return False
         try:
-            verdict = await policy_eval("PHASE_TOOL_RESULT", {"result": result})
+            verdict = await policy_eval(
+                "PHASE_TOOL_RESULT", {"name": tool_name, "result": result}
+            )
         except Exception as exc:  # noqa: BLE001 — result phase fails open
             logger.warning("qwen TOOL_RESULT policy eval failed for %s: %s", tool_name, exc)
             return False
