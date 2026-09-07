@@ -91,7 +91,14 @@ _YAML_1_2_BOOL_RE = re.compile(r"^(?:true|True|TRUE|false|False|FALSE)$")
 
 # ``executor.config`` keys kept as their nested YAML structure instead of
 # string-coerced — their consumers read the nested mapping/list shape.
-_STRUCTURED_EXECUTOR_CONFIG_KEYS: frozenset[str] = frozenset()
+#
+# ``acp_agent`` is one of those consumers and the set was empty, so the
+# embedded-agent form documented on ``_build_acp_spawn_env`` could not work: the
+# block arrived there as ``str(dict)`` and hit its own
+# ``"executor acp_agent must be a mapping with name and command"`` guard on
+# every session. Nothing else validates the shape, so the failure only showed up
+# at spawn time.
+_STRUCTURED_EXECUTOR_CONFIG_KEYS: frozenset[str] = frozenset({"acp_agent"})
 
 # Copy the resolver dict onto the subclass before mutating — it's inherited
 # from SafeLoader by reference, so in-place edits below would strip

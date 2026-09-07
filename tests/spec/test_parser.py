@@ -2832,6 +2832,40 @@ def test_parse_executor_config_field(tmp_path: Path) -> None:
     }
 
 
+def test_parse_executor_config_keeps_acp_agent_a_mapping(tmp_path: Path) -> None:
+    """An embedded ``acp_agent`` survives parsing as a mapping.
+
+    Every other ``executor.config`` value is string-coerced, but this one is
+    read as a nested mapping by ``_build_acp_spawn_env``. Coercing it turns the
+    block into ``str(dict)``, which that builder rejects with "executor
+    acp_agent must be a mapping with name and command" — at spawn time, on
+    every session, with nothing between the two to catch it. So the round trip
+    is asserted here rather than the parser's output alone.
+    """
+    from omnigent.runtime.workflow import _build_acp_spawn_env
+
+    config = {
+        "spec_version": 1,
+        "executor": {
+            "type": "omnigent",
+            "config": {
+                "harness": "acp:helper",
+                "acp_agent": {"name": "Helper", "command": "helper --acp"},
+            },
+        },
+    }
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    spec = parse(tmp_path)
+
+    assert spec.executor.config["acp_agent"] == {
+        "name": "Helper",
+        "command": "helper --acp",
+    }
+    env = _build_acp_spawn_env(spec)
+    assert env["HARNESS_ACP_NAME"] == "Helper"
+    assert env["HARNESS_ACP_COMMAND"] == "helper --acp"
+
+
 def test_parse_executor_config_missing_defaults_to_empty(
     tmp_path: Path,
 ) -> None:
