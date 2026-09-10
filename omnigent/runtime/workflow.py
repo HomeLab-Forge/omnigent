@@ -1472,8 +1472,62 @@ def _build_qwen_spawn_env(
     os_env_payload = _serialize_os_env(spec.os_env)
     if os_env_payload is not None:
         env["HARNESS_QWEN_OS_ENV"] = os_env_payload
+    system_md = _resolve_qwen_system_md(spec, workdir)
+    if system_md is not None:
+        env["QWEN_SYSTEM_MD"] = system_md
     _apply_harness_path_override(env, "qwen")
     return env
+
+
+def _resolve_qwen_system_md(spec: AgentSpec, workdir: Path | None) -> str | None:
+    """
+    Resolve ``executor.config.system_md`` to an absolute path for qwen.
+
+    ACP has no system-prompt slot, so Omnigent delivers the agent's prompt as
+    a user turn and Qwen Code's own baked prompt keeps the system role. That
+    prompt is not neutral: it carries a persistent-memory subsystem, a bundled
+    skill catalogue, a todo doctrine, and few-shot examples that write tool
+    calls as ``[tool_call: NAME for 'arg']`` prose. A small model that cannot
+    find the tool it wants falls back to whichever of those is nearest, and
+    the agent spends its turn tidying Qwen's memory directory instead of doing
+    the work.
+
+    ``QWEN_SYSTEM_MD`` is Qwen's own supported override, and the qwen spawn env
+    already allows the ``QWEN_`` prefix through
+    (``QwenExecutor._build_spawn_env``), so naming the file here is the whole
+    wiring. The path is bundle-relative and resolved against the extracted
+    bundle so a spec cannot reach outside it.
+
+    :param spec: The agent spec.
+    :param workdir: The extracted bundle directory, or ``None`` when the
+        caller has no bundle on disk (the value is then unusable and the
+        override is skipped).
+    :returns: An absolute path string, or ``None`` when unset or unresolvable.
+    """
+    config = getattr(spec.executor, "config", None) or {}
+    raw = config.get("system_md")
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    if workdir is None:
+        _logger.warning(
+            "qwen: executor.config.system_md=%r ignored — no bundle dir", raw
+        )
+        return None
+    root = Path(workdir).resolve()
+    candidate = (root / raw).resolve()
+    if not candidate.is_relative_to(root):
+        _logger.warning(
+            "qwen: executor.config.system_md=%r escapes the bundle — ignored", raw
+        )
+        return None
+    if not candidate.is_file():
+        _logger.warning(
+            "qwen: executor.config.system_md=%r not found at %s — ignored",
+            raw,
+            candidate,
+        )
+        return None
+    return str(candidate)
 
 
 def _build_goose_spawn_env(
