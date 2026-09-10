@@ -215,3 +215,45 @@ def test_load_skill_schema_lists_skill_names(
     desc = schema["function"]["description"]
     assert "summarize" in desc
     assert "code-review" in desc
+
+
+def test_load_skill_schema_carries_each_description(
+    skill_no_resources: SkillSpec,
+    skill_with_resources: SkillSpec,
+) -> None:
+    """
+    The schema pairs every skill with its description.
+
+    The description is the skill's entry condition, and it is what lets a
+    model pick between skills; a bare list of names does not.
+    """
+    tool = LoadSkillTool(
+        [skill_no_resources, skill_with_resources],
+    )
+    desc = tool.get_schema()["function"]["description"]
+    assert "code-review: Reviews code." in desc
+    assert "summarize: Summarizes text." in desc
+
+
+def test_load_skill_schema_elides_a_long_description() -> None:
+    """
+    A long description is collapsed to one line and truncated.
+
+    ``SKILL.md`` allows 1024 characters and wraps them as a YAML block
+    scalar; the schema is sent on every request, so it keeps one bounded
+    line per skill.
+    """
+    tool = LoadSkillTool(
+        [
+            SkillSpec(
+                name="verbose",
+                description="word " * 400,
+                content="body",
+            )
+        ]
+    )
+    desc = tool.get_schema()["function"]["description"]
+    line = [x for x in desc.splitlines() if x.startswith("- verbose:")][0]
+    assert len(line) < 260
+    assert line.endswith("\u2026")
+    assert "\n" not in line

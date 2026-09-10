@@ -18,6 +18,31 @@ _ALREADY_LOADED = (
     "repeated below — re-loading a skill does not advance the task.]"
 )
 
+# Per-skill budget in the ``load_skill`` schema. Five skills at this width
+# cost about a kilobyte of prompt on every request — cheap next to a model
+# that never loads a skill because it cannot tell them apart.
+_SKILL_SUMMARY_CHARS = 220
+
+
+def _summarize(description: str, *, limit: int = _SKILL_SUMMARY_CHARS) -> str:
+    """
+    Collapse a skill description to one line for the tool schema.
+
+    A ``SKILL.md`` description may be a wrapped YAML block scalar and may
+    run to 1024 characters. The schema needs one readable line per skill,
+    and every character here is spent on every request of every turn, so
+    long ones are cut on a word boundary.
+
+    :param description: The skill's ``description`` frontmatter value.
+    :param limit: Maximum characters to keep, e.g. ``220``.
+    :returns: A single-line summary, elided with ``…`` when truncated.
+    """
+    collapsed = " ".join(description.split())
+    if len(collapsed) <= limit:
+        return collapsed
+    head = collapsed[:limit].rsplit(" ", 1)[0]
+    return f"{head}…"
+
 
 class LoadSkillTool(Tool):
     """
@@ -98,15 +123,26 @@ class LoadSkillTool(Tool):
 
         :returns: A tool schema dict.
         """
-        skill_names = [s.name for s in self._skills]
+        # Name AND description. The description is the skill's entry
+        # condition — the only thing that lets a model choose between
+        # skills — and listing names alone leaves it guessing. An agent
+        # whose prompt says "compare the facts with each skill's entry
+        # condition and outcome" is then pointing at a list that does not
+        # carry one, and on a small model the observed result is that no
+        # skill is ever loaded.
+        lines = [
+            f"- {skill.name}: {_summarize(skill.description)}"
+            for skill in self._skills
+        ]
+        listing = "\n".join(lines)
         return {
             "type": "function",
             "function": {
                 "name": "load_skill",
                 "description": (
-                    "Load a skill's full instructions by "
-                    "name. Available skills: "
-                    f"{', '.join(skill_names)}"
+                    "Load a skill's full instructions by name. "
+                    "Available skills:\n"
+                    f"{listing}"
                 ),
                 "parameters": {
                     "type": "object",
